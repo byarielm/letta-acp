@@ -49,6 +49,7 @@ import {
   isUsableModel,
   variantOf,
 } from "./model-options.js";
+import { planEntriesFrom, UPDATE_PLAN_TOOL } from "./plan.js";
 import { withAcpRequestTimeout } from "./request-timeout.js";
 import { SessionRegistry } from "./session-registry.js";
 import {
@@ -1014,6 +1015,7 @@ export class LettaAcpAgent {
           message.rawArguments,
           message.toolInput,
         );
+        await this.emitPlan(sessionId, cx, toolName, input.input);
         const diffContent = toolDiffContent(toolName, input.input);
         const hasDiff = existing?.hasDiff === true || diffContent.length > 0;
         const nativeTerminal =
@@ -1127,6 +1129,26 @@ export class LettaAcpAgent {
         // queue_update, loop_status, stream_event, retry — no ACP equivalent.
         return false;
     }
+  }
+
+  /**
+   * Report an UpdatePlan tool call as an ACP plan update, so the client can show
+   * the agent's task list. The tool carries the whole list on every call, which
+   * matches ACP replacing the plan on each update.
+   */
+  private async emitPlan(
+    sessionId: string,
+    cx: AgentContext,
+    toolName: string | undefined,
+    input: unknown,
+  ): Promise<void> {
+    if (toolName !== UPDATE_PLAN_TOOL) return;
+    const entries = planEntriesFrom(input);
+    if (!entries) return;
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: { sessionUpdate: "plan", entries },
+    });
   }
 
   private toPromptResponse(
