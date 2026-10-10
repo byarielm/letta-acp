@@ -28,6 +28,15 @@ export interface LettaAcpConfig {
    * listing active runs. Defaults to 30 seconds.
    */
   prematureResultGraceMs?: number;
+  /**
+   * Opt-in. When set, a round that ends while the server still lists active runs
+   * keeps the turn open instead of resolving it, waiting up to this many
+   * milliseconds for the run to speak again. Each round that produces output
+   * re-arms the window, so work stays in-turn; a silent round still ends the
+   * turn, bounding how long a stale run can hold it. Disabled by default because
+   * it delays the prompt response whenever a run is listed but idle.
+   */
+  activeRunSilenceMs?: number;
 }
 
 const PERMISSION_MODES: PermissionMode[] = [
@@ -104,11 +113,19 @@ export function configFromEnv(
     );
   }
 
+  const activeRunSilenceMs = Number.parseInt(
+    env.LETTA_ACP_ACTIVE_RUN_SILENCE_MS ?? "",
+    10,
+  );
+
   return {
     clientOptions,
     agentId: env.LETTA_AGENT_ID,
     model: env.LETTA_ACP_MODEL,
     permissionMode: permissionMode as PermissionMode,
+    ...(Number.isFinite(activeRunSilenceMs) && activeRunSilenceMs > 0
+      ? { activeRunSilenceMs }
+      : {}),
     sessionRegistryDir:
       env.LETTA_ACP_STATE_DIR ?? join(homedir(), ".letta", "letta-acp", "sessions"),
     sessionRegistryScope,

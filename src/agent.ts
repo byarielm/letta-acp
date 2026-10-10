@@ -146,7 +146,8 @@ type PumpOutcome =
   /** Turn reported complete while the server still listed active runs. */
   | { kind: "premature"; result: SDKResultMessage }
   | { kind: "idle" }
-  | { kind: "stream_end" };
+  /** Stream ended; carries what the round last saw for active runs. */
+  | { kind: "stream_end"; activeRunIds: readonly string[]; sawActivity: boolean };
 
 const IMAGE_MEDIA_TYPES = new Set([
   "image/png",
@@ -167,6 +168,8 @@ export class LettaAcpAgent {
   private readonly client: LettaAgentClient;
   private readonly outOfTurnPermissionTimeoutMs: number;
   private readonly prematureResultGraceMs: number;
+  /** 0 disables staying with runs whose stream ended while still listed. */
+  private readonly activeRunSilenceMs: number;
   private readonly sessionRegistry: SessionRegistry;
   private readonly sessions = new Map<string, AcpSessionState>();
   private agentIdPromise: Promise<string> | null = null;
@@ -188,6 +191,7 @@ export class LettaAcpAgent {
       DEFAULT_OUT_OF_TURN_PERMISSION_TIMEOUT_MS;
     this.prematureResultGraceMs =
       config.prematureResultGraceMs ?? DEFAULT_PREMATURE_RESULT_GRACE_MS;
+    this.activeRunSilenceMs = config.activeRunSilenceMs ?? 0;
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -678,6 +682,7 @@ export class LettaAcpAgent {
       // stream while approvals resolve) until the run goes idle.
       let mode: "turn" | "recovery" = "turn";
       let graceMs: number | undefined;
+      let pendingRunIds: readonly string[] = [];
       while (true) {
         const outcome = await this.pumpStream(
           params.sessionId,
@@ -693,7 +698,8 @@ export class LettaAcpAgent {
             // with the run is another round — the same recovery the
             // approval_conflict path uses, but on a deadline in case the
             // server really was done.
-            const runIds = outcome.result.runIds?.join(", ") ?? "unknown";
+            pendingRunIds = outcome.result.runIds ?? [];
+            const runIds = pendingRunIds.join(", ") || "unknown";
             log(`turn reported complete while runs are active (${runIds})`);
             mode = "recovery";
             graceMs = this.prematureResultGraceMs;
@@ -709,8 +715,36 @@ export class LettaAcpAgent {
             return this.toPromptResponse(state, result);
           }
           case "idle":
-          case "stream_end":
+            // The round heard nothing for the whole window: the server really is
+            // quiet, so end rather than wait on a run that may never settle.
             return { stopReason: "end_turn" };
+          case "stream_end": {
+            // The SDK ended its stream, but a run the server still lists as active
+            // is not finished: resolving now would push whatever it produces next
+            // out-of-turn, where the client shows nothing until the next prompt.
+            // When enabled, stay with the run; the round's first-message deadline
+            // becomes the silence window, and a round that says nothing still ends
+            // the turn, so a stale run cannot hold it open indefinitely.
+            const stillActive =
+              outcome.activeRunIds.length > 0
+                ? outcome.activeRunIds
+                : pendingRunIds;
+            if (
+              this.activeRunSilenceMs > 0 &&
+              outcome.sawActivity &&
+              stillActive.length > 0
+            ) {
+              log(
+                `stream ended while runs are still active ` +
+                  `(${stillActive.join(", ")}); staying up to ${this.activeRunSilenceMs}ms`,
+              );
+              pendingRunIds = stillActive;
+              mode = "recovery";
+              graceMs = this.activeRunSilenceMs;
+              continue;
+            }
+            return { stopReason: "end_turn" };
+          }
         }
       }
     } catch (error) {
@@ -942,7 +976,7 @@ export class LettaAcpAgent {
       );
       sawActivity = sawActivity || forwarded;
     }
-    return { kind: "stream_end" };
+    return { kind: "stream_end", activeRunIds, sawActivity };
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -968,6 +1002,26 @@ export class LettaAcpAgent {
       }
     }
     this.sessions.clear();
+  }
+
+  /**
+   * Report an UpdatePlan tool call as an ACP plan update, so the client can show
+   * the agent's task list. The tool carries the whole list on every call, which
+   * matches ACP replacing the plan on each update.
+   */
+  private async emitPlan(
+    sessionId: string,
+    cx: AgentContext,
+    toolName: string | undefined,
+    input: unknown,
+  ): Promise<void> {
+    if (toolName !== UPDATE_PLAN_TOOL) return;
+    const entries = planEntriesFrom(input);
+    if (!entries) return;
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: { sessionUpdate: "plan", entries },
+    });
   }
 
   /**
@@ -1129,26 +1183,6 @@ export class LettaAcpAgent {
         // queue_update, loop_status, stream_event, retry — no ACP equivalent.
         return false;
     }
-  }
-
-  /**
-   * Report an UpdatePlan tool call as an ACP plan update, so the client can show
-   * the agent's task list. The tool carries the whole list on every call, which
-   * matches ACP replacing the plan on each update.
-   */
-  private async emitPlan(
-    sessionId: string,
-    cx: AgentContext,
-    toolName: string | undefined,
-    input: unknown,
-  ): Promise<void> {
-    if (toolName !== UPDATE_PLAN_TOOL) return;
-    const entries = planEntriesFrom(input);
-    if (!entries) return;
-    await cx.notify(methods.client.session.update, {
-      sessionId,
-      update: { sessionUpdate: "plan", entries },
-    });
   }
 
   private toPromptResponse(
