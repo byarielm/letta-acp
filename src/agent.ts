@@ -32,6 +32,7 @@ import {
   type McpServers,
   type MessageContentItem,
   type PermissionMode,
+  type ReasoningEffort,
   type SDKMessage,
   type SDKResultMessage,
 } from "@letta-ai/letta-agent-sdk";
@@ -42,6 +43,12 @@ import {
   type EditorFsCapabilities,
 } from "./editor-tools.js";
 import { historyToUpdates } from "./history-replay.js";
+import {
+  collapseVariants,
+  groupedModelOptions,
+  isUsableModel,
+  variantOf,
+} from "./model-options.js";
 import { withAcpRequestTimeout } from "./request-timeout.js";
 import { SessionRegistry } from "./session-registry.js";
 import {
@@ -52,6 +59,11 @@ import {
   permissionModeConfigOption,
   sessionModeState,
 } from "./session-modes.js";
+import {
+  entryReasoningEffort,
+  THOUGHT_LEVEL_CONFIG_ID,
+  thoughtLevelConfigOption,
+} from "./thought-level.js";
 import {
   buildAvailableCommands,
   isExecuteCommand,
@@ -98,6 +110,8 @@ interface AcpSessionState {
   cwd: string;
   /** Model handle reported by the runtime, updated after ACP model changes. */
   currentModel: string | undefined;
+  /** Reasoning tier selected over ACP; validated against the model catalog. */
+  reasoningEffort: string | undefined;
 }
 
 /** Max history messages replayed on session/load. */
@@ -349,31 +363,103 @@ export class LettaAcpAgent {
     }
   }
 
+  /**
+   * Provider names the runtime reports as connected, or null when it cannot say.
+   *
+   * Asked over the runtime's own protocol rather than a Cloud-only endpoint so
+   * local and self-hosted backends filter identically. A failed or empty answer
+   * is treated as "unknown" — the caller then leaves the model list unfiltered
+   * rather than hide models it cannot confirm are unusable.
+   */
+  private async connectedProviderNames(
+    session: LettaCodeSession,
+  ): Promise<Set<string> | null> {
+    try {
+      const response = await session.sendCommand(
+        { type: "list_connect_providers", target: "local" },
+        { responseType: "list_connect_providers_response", timeoutMs: 5_000 },
+      );
+      const providers = (response as { providers?: unknown }).providers;
+      if (!Array.isArray(providers)) return null;
+      const names = new Set<string>();
+      for (const raw of providers) {
+        const entry = raw as {
+          provider_names?: unknown;
+          connected?: { is_connected?: unknown; provider_name?: unknown };
+          connected_providers?: Array<{
+            is_connected?: unknown;
+            provider_name?: unknown;
+          }>;
+        };
+        const states = [
+          ...(entry.connected ? [entry.connected] : []),
+          ...(Array.isArray(entry.connected_providers)
+            ? entry.connected_providers
+            : []),
+        ];
+        if (!states.some((state) => state?.is_connected === true)) continue;
+        for (const state of states) {
+          if (typeof state?.provider_name === "string") {
+            names.add(state.provider_name);
+          }
+        }
+        if (Array.isArray(entry.provider_names)) {
+          for (const name of entry.provider_names) {
+            if (typeof name === "string") names.add(name);
+          }
+        }
+      }
+      return names.size > 0 ? names : null;
+    } catch (error) {
+      log(`could not list connected providers: ${String(error)}`);
+      return null;
+    }
+  }
+
   private async sessionConfigOptions(
     state: AcpSessionState,
   ): Promise<SessionConfigOption[]> {
     const { entries } = await state.session.listModels();
-    const models = [...new Map(entries.map((entry) => [entry.id, entry])).values()];
-    const selected = models.find(
-      (entry) =>
-        entry.id === state.currentModel || entry.handle === state.currentModel,
-    );
-    let currentValue =
-      selected?.id ??
-      models.find((entry) => entry.isDefault)?.id ??
-      models[0]?.id;
-    const options = models.map((entry) => ({
-      value: entry.id,
-      name: entry.label,
-      ...(entry.description ? { description: entry.description } : {}),
-    }));
+    const catalog = [
+      ...new Map(entries.map((entry) => [entry.id, entry])).values(),
+    ];
+    // Offer only models the runtime can actually serve: those from connected
+    // providers plus Letta's built-ins. Asked of the runtime's own provider
+    // store so self-hosted backends filter too; if it cannot answer, show the
+    // whole catalog rather than hide every model.
+    const connected = await this.connectedProviderNames(state.session);
+    const models = connected
+      ? catalog.filter((entry) => isUsableModel(entry, connected))
+      : catalog;
+    if (connected) {
+      log(
+        `models: ${models.length}/${catalog.length} usable ` +
+          `(${connected.size} connected providers: ${[...connected].sort().join(", ")})`,
+      );
+    }
+
+    // Collapse each model variant to one row and group rows by provider. Reasoning
+    // tiers are separate catalog entries, but the tier is picked through the
+    // thought-level option, so the picker must not repeat the model per tier.
+    const variants = collapseVariants(models);
+    const active =
+      models.find((entry) => entry.id === state.currentModel) ??
+      models.find((entry) => entry.handle === state.currentModel);
+    let currentValue = active
+      ? (variantOf(active, variants)?.id ?? active.id)
+      : (variants.find((entry) => entry.isDefault)?.id ?? variants[0]?.id);
+    const options = groupedModelOptions(variants);
 
     // A custom model handle may be active even when it is not in the curated
     // catalog. ACP requires currentValue to identify one of the options, so
     // retain that model rather than falsely presenting a different selection.
-    if (!selected && state.currentModel) {
+    if (!active && state.currentModel) {
       currentValue = state.currentModel;
-      options.unshift({ value: state.currentModel, name: state.currentModel });
+      options.unshift({
+        group: "custom",
+        name: "Custom",
+        options: [{ value: state.currentModel, name: state.currentModel }],
+      });
     }
     const configOptions: SessionConfigOption[] = [
       permissionModeConfigOption(state.modeId),
@@ -388,6 +474,17 @@ export class LettaAcpAgent {
         currentValue,
         options,
       });
+    }
+    // Reasoning tiers are catalog entries that share a handle, so derive them
+    // from the catalog. A custom handle outside it has no tiers, hence no option.
+    const thoughtLevel = thoughtLevelConfigOption(
+      models,
+      active?.handle ?? state.currentModel,
+      state.reasoningEffort ??
+        (active ? entryReasoningEffort(active) : undefined),
+    );
+    if (thoughtLevel) {
+      configOptions.push(thoughtLevel);
     }
     return configOptions;
   }
@@ -413,7 +510,22 @@ export class LettaAcpAgent {
       }
       const result = await state.session.updateModel(params.value);
       state.currentModel = result.modelHandle ?? result.modelId ?? params.value;
+      // A new model may not offer the previous tier; let the catalog decide.
+      state.reasoningEffort = undefined;
       log(`session ${params.sessionId} model -> ${state.currentModel}`);
+      return { configOptions: await this.sessionConfigOptions(state) };
+    }
+    if (params.configId === THOUGHT_LEVEL_CONFIG_ID) {
+      if (typeof params.value !== "string") {
+        throw new Error("The thought level configuration option requires a tier");
+      }
+      // Reasoning-only update: keeps the model and its other settings. The SDK
+      // rejects tiers the target handle does not advertise.
+      await state.session.updateModel({
+        reasoningEffort: params.value as ReasoningEffort,
+      });
+      state.reasoningEffort = params.value;
+      log(`session ${params.sessionId} thought level -> ${params.value}`);
       return { configOptions: await this.sessionConfigOptions(state) };
     }
     throw new Error(`Unknown session configuration option: ${params.configId}`);
@@ -513,6 +625,7 @@ export class LettaAcpAgent {
       modeId: this.config.permissionMode,
       cwd: options.cwd,
       currentModel: bootstrap.model ?? this.config.model,
+      reasoningEffort: undefined,
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
