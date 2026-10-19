@@ -244,7 +244,8 @@ export class LettaAcpAgent {
     params: NewSessionRequest,
     cx: AgentContext,
   ): Promise<NewSessionResponse> {
-    const agentId = await this.ensureAgent();
+    const started = performance.now();
+    const agentId = await timed("ensure agent", () => this.ensureAgent());
     const { sessionId, state } = await this.openSession({
       cwd: params.cwd,
       resumeId: null,
@@ -255,11 +256,13 @@ export class LettaAcpAgent {
     await this.rememberSession(agentId, sessionId, params.cwd);
     log(`session ${sessionId} -> agent ${agentId} (cwd: ${params.cwd})`);
     this.announceCommands(sessionId, cx);
+    const configOptions = await this.sessionConfigOptions(state);
     this.startReader(sessionId, state);
+    log(`timing: new session ${Math.round(performance.now() - started)}ms`);
     return {
       sessionId,
       modes: sessionModeState(state.modeId),
-      configOptions: await this.sessionConfigOptions(state),
+      configOptions,
     };
   }
 
@@ -286,6 +289,7 @@ export class LettaAcpAgent {
     params: LoadSessionRequest,
     cx: AgentContext,
   ): Promise<LoadSessionResponse> {
+    const started = performance.now();
     if (
       !params.sessionId.startsWith("conv-") &&
       !params.sessionId.startsWith("local-conv-")
@@ -302,10 +306,9 @@ export class LettaAcpAgent {
       mcpServers: params.mcpServers,
     });
     await this.rememberSession(state.session.agentId, sessionId, params.cwd);
-    const history = await state.session.listMessages({
-      order: "desc",
-      limit: LOAD_HISTORY_LIMIT,
-    });
+    const history = await timed("load history", () =>
+      state.session.listMessages({ order: "desc", limit: LOAD_HISTORY_LIMIT }),
+    );
     if (history.hasMore) {
       log(
         `session ${sessionId} has more than ${LOAD_HISTORY_LIMIT} messages; replaying the most recent ${LOAD_HISTORY_LIMIT}`,
@@ -315,15 +318,19 @@ export class LettaAcpAgent {
       terminalOutput: this.supportsTerminalOutput,
       cwd: state.cwd,
     });
-    for (const update of updates) {
-      await cx.notify(methods.client.session.update, { sessionId, update });
-    }
+    await timed("replay history", async () => {
+      for (const update of updates) {
+        await cx.notify(methods.client.session.update, { sessionId, update });
+      }
+    });
     log(`loaded session ${sessionId} (${updates.length} replayed updates)`);
     this.announceCommands(sessionId, cx);
+    const configOptions = await this.sessionConfigOptions(state);
     this.startReader(sessionId, state);
+    log(`timing: load session ${Math.round(performance.now() - started)}ms`);
     return {
       modes: sessionModeState(state.modeId),
-      configOptions: await this.sessionConfigOptions(state),
+      configOptions,
     };
   }
 
@@ -470,10 +477,10 @@ export class LettaAcpAgent {
     }
     const cached = {
       expiresAt: Infinity,
-      promise: (async () => {
+      promise: timed("model discovery", async () => {
         const [{ entries }, connected] = await Promise.all([
-          state.session.listModels(),
-          this.connectedProviderNames(state.session),
+          timed("model catalog", () => state.session.listModels()),
+          timed("connected providers", () => this.connectedProviderNames(state.session)),
         ]);
         const catalog = [
           ...new Map(entries.map((entry) => [entry.id, entry])).values(),
@@ -489,7 +496,7 @@ export class LettaAcpAgent {
           );
         }
         return models;
-      })(),
+      }),
     };
     state.modelCatalog = cached;
     try {
@@ -561,6 +568,7 @@ export class LettaAcpAgent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
+    const started = performance.now();
     const state = this.sessions.get(params.sessionId);
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
@@ -571,13 +579,17 @@ export class LettaAcpAgent {
       }
       state.modeId = params.value;
       log(`session ${params.sessionId} mode -> ${params.value}`);
-      return { configOptions: await this.sessionConfigOptions(state) };
+      const result = { configOptions: await this.sessionConfigOptions(state) };
+      log(`timing: set session config ${params.configId} ${Math.round(performance.now() - started)}ms`);
+      return result;
     }
     if (params.configId === "model") {
       if (typeof params.value !== "string") {
         throw new Error("The model configuration option requires a model id");
       }
+      const optionsStarted = performance.now();
       const configOptions = await this.sessionConfigOptions(state);
+      const optionsMs = Math.round(performance.now() - optionsStarted);
       const selected = configOptions.find((option) => option.id === "model");
       const models = await this.sessionModels(state);
       // A handle alone cannot confirm which context-window variant is active.
@@ -588,17 +600,30 @@ export class LettaAcpAgent {
         selectionKnown &&
         (params.value === state.currentModel || params.value === selected?.currentValue)
       ) {
+        log(
+          `timing: set session config ${params.configId} ${Math.round(performance.now() - started)}ms ` +
+            `(options ${optionsMs}, no update)`,
+        );
         return { configOptions };
       }
+      const updateStarted = performance.now();
       const result = await state.session.updateModel(params.value);
       // Commit the successful mutation before any later discovery can fail.
       state.currentModel = models.some((entry) => entry.id === params.value)
         ? params.value
         : result.modelHandle ?? result.modelId ?? params.value;
       // A new model may not offer the previous tier; let the catalog decide.
+      const updateMs = Math.round(performance.now() - updateStarted);
+      const rebuildStarted = performance.now();
+      const rebuilt = await this.sessionConfigOptions(state);
+      const rebuildMs = Math.round(performance.now() - rebuildStarted);
       state.reasoningEffort = undefined;
       log(`session ${params.sessionId} model -> ${state.currentModel}`);
-      return { configOptions: await this.sessionConfigOptions(state) };
+      log(
+        `timing: set session config ${params.configId} ${Math.round(performance.now() - started)}ms ` +
+          `(options ${optionsMs}, updateModel ${updateMs}, rebuild ${rebuildMs})`,
+      );
+      return { configOptions: rebuilt };
     }
     if (params.configId === THOUGHT_LEVEL_CONFIG_ID) {
       if (typeof params.value !== "string") {
@@ -606,12 +631,18 @@ export class LettaAcpAgent {
       }
       // Reasoning-only update: keeps the model and its other settings. The SDK
       // rejects tiers the target handle does not advertise.
+      const levelStarted = performance.now();
       await state.session.updateModel({
         reasoningEffort: params.value as ReasoningEffort,
       });
       state.reasoningEffort = params.value;
+      const rebuilt = await this.sessionConfigOptions(state);
       log(`session ${params.sessionId} thought level -> ${params.value}`);
-      return { configOptions: await this.sessionConfigOptions(state) };
+      log(
+        `timing: set session config ${params.configId} ${Math.round(performance.now() - started)}ms ` +
+          `(update+rebuild ${Math.round(performance.now() - levelStarted)})`,
+      );
+      return { configOptions: rebuilt };
     }
     throw new Error(`Unknown session configuration option: ${params.configId}`);
   }
@@ -671,7 +702,7 @@ export class LettaAcpAgent {
     }
     if (existing?.runtimeConfigKey === runtimeConfigKey) {
       try {
-        const ready = await existing.session.ready();
+        const ready = await timed("reuse runtime", () => existing.session.ready());
         existing.clientContext = options.clientContext;
         return { sessionId: ready.conversationId, state: existing };
       } catch (error) {
@@ -709,14 +740,14 @@ export class LettaAcpAgent {
       ? this.client.resumeSession(options.resumeId, sessionOptions)
       : this.client.createSession(options.agentId ?? "", sessionOptions);
     // ready() initializes the runtime without fetching a redundant history page.
-    const bootstrap = await (async () => {
+    const bootstrap = await timed("initialize runtime", async () => {
       try {
         return await session.ready();
       } catch (error) {
         session.close();
         throw error;
       }
-    })();
+    });
     const sessionId = options.resumeId ?? session.conversationId;
     if (!sessionId) {
       session.close();
@@ -1674,6 +1705,15 @@ export function toLettaContent(blocks: ContentBlock[]): MessageContentItem[] {
     content.push({ type: "text", text: "" });
   }
   return content;
+}
+
+async function timed<T>(label: string, action: () => Promise<T>): Promise<T> {
+  const started = performance.now();
+  try {
+    return await action();
+  } finally {
+    log(`timing: ${label} ${Math.round(performance.now() - started)}ms`);
+  }
 }
 
 function log(message: string): void {
