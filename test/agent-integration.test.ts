@@ -1,9 +1,9 @@
-import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentContext, McpServer } from "@agentclientprotocol/sdk";
-import type { LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
+import type { LettaCodeModelEntry, LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
 import { LettaAcpAgent, toSdkMcpServers } from "../src/agent.js";
 import { SessionRegistry } from "../src/session-registry.js";
 
@@ -18,6 +18,7 @@ type SocketListener = (event: unknown) => void;
 interface ServerSocket {
   readonly channel: "control" | "stream";
   push(message: WireMessage): void;
+  close(): void;
 }
 
 class FakeAppServer {
@@ -26,7 +27,25 @@ class FakeAppServer {
   readonly createdAgentPinGlobals: unknown[] = [];
   readonly approvalResponses: WireMessage[] = [];
   readonly conversationRetrieveIds: string[] = [];
+  readonly historyRequests: WireMessage[] = [];
+  readonly modelRequests: WireMessage[] = [];
+  readonly providerRequests: WireMessage[] = [];
+  modelFailuresRemaining = 0;
+  modelEntries: LettaCodeModelEntry[] = [
+    {
+      id: "test-model", handle: "test/model", label: "Test Model",
+      description: "Deterministic test model", isDefault: true,
+    },
+    {
+      id: "other-model", handle: "test/other-model", label: "Other Model",
+      description: "Alternate deterministic model",
+    },
+  ];
+  modelResponseGate: Promise<void> | undefined;
+  onModelUpdateResponse: (() => void) | undefined;
+  private modelRequestWaiters: Array<() => void> = [];
   closedSockets = 0;
+  private readonly sockets: ServerSocket[] = [];
   readonly updatedModelPayloads: WireMessage[] = [];
   private nextConversation = 0;
   private activeControlSocket: ServerSocket | null = null;
@@ -49,6 +68,7 @@ class FakeAppServer {
         this.channel = new URL(url).searchParams.get("channel") === "stream"
           ? "stream"
           : "control";
+        server.sockets.push(this);
         queueMicrotask(() => {
           this.readyState = 1;
           this.emit("open", {});
@@ -92,6 +112,14 @@ class FakeAppServer {
     return FakeSocket as unknown as LettaCodeSocketConstructor;
   }
 
+  nextModelRequest(): Promise<void> {
+    return new Promise((resolve) => this.modelRequestWaiters.push(resolve));
+  }
+
+  closeSockets(): void {
+    for (const socket of this.sockets) socket.close();
+  }
+
   sendBackgroundReply(text: string): void {
     if (!this.activeControlSocket || !this.activeRuntime) throw new Error("No runtime");
     this.pushDelta(this.activeControlSocket, this.activeRuntime, {
@@ -99,9 +127,6 @@ class FakeAppServer {
     });
     this.pushDelta(this.activeControlSocket, this.activeRuntime, {
       message_type: "stop_reason", run_id: "run-background", stop_reason: "end_turn",
-    });
-    this.pushDelta(this.activeControlSocket, this.activeRuntime, {
-      message_type: "usage_statistics", run_id: "run-background",
     });
   }
 
@@ -172,7 +197,9 @@ class FakeAppServer {
     switch (message.type) {
       case "runtime_start": {
         const requestId = requiredString(message.request_id, "runtime_start.request_id");
-        const conversationId = `conv-test-${++this.nextConversation}`;
+        const conversationId = typeof message.conversation_id === "string"
+          ? message.conversation_id
+          : `conv-test-${++this.nextConversation}`;
         const createAgent = message.create_agent as
           | { body?: WireMessage; pin_global?: boolean }
           | undefined;
@@ -243,6 +270,7 @@ class FakeAppServer {
         return;
       }
       case "conversation_messages_list":
+        this.historyRequests.push(message);
         socket.push({
           type: "conversation_messages_list_response",
           request_id: requiredString(
@@ -254,29 +282,45 @@ class FakeAppServer {
           has_more: false,
         });
         return;
-      case "list_models":
+      case "list_connect_providers":
+        this.providerRequests.push(message);
         socket.push({
+          type: "list_connect_providers_response",
+          request_id: requiredString(message.request_id, "list_connect_providers.request_id"),
+          success: true,
+          providers: [{
+            provider_names: ["test"],
+            connected: { is_connected: true, provider_name: "test" },
+          }],
+        });
+        return;
+      case "list_models": {
+        this.modelRequests.push(message);
+        for (const waiter of this.modelRequestWaiters.splice(0)) waiter();
+        if (this.modelFailuresRemaining > 0) {
+          this.modelFailuresRemaining -= 1;
+          socket.push({
+            type: "list_models_response",
+            request_id: requiredString(message.request_id, "list_models.request_id"),
+            success: false,
+            error: "model discovery failed",
+          });
+          return;
+        }
+        const response = {
           type: "list_models_response",
           request_id: requiredString(message.request_id, "list_models.request_id"),
           success: true,
-          entries: [
-            {
-              id: "test-model",
-              handle: "test/model",
-              label: "Test Model",
-              description: "Deterministic test model",
-              isDefault: true,
-            },
-            {
-              id: "other-model",
-              handle: "test/other-model",
-              label: "Other Model",
-              description: "Alternate deterministic model",
-            },
-          ],
-          available_handles: ["test/model", "test/other-model"],
-        });
+          entries: this.modelEntries,
+          available_handles: [...new Set(this.modelEntries.map((entry) => entry.handle))],
+        };
+        if (this.modelResponseGate) {
+          void this.modelResponseGate.then(() => socket.push(response));
+        } else {
+          socket.push(response);
+        }
         return;
+      }
       case "update_model": {
         const payload = message.payload as WireMessage;
         this.updatedModelPayloads.push(payload);
@@ -290,7 +334,8 @@ class FakeAppServer {
               : requiredString(payload.model_id, "update_model.model_id");
         const handle =
           modelHandle ??
-          (modelId === "other-model" ? "test/other-model" : "test/model");
+          this.modelEntries.find((entry) => entry.id === modelId)?.handle ?? "test/model";
+        this.onModelUpdateResponse?.();
         socket.push({
           type: "update_model_response",
           request_id: requiredString(message.request_id, "update_model.request_id"),
@@ -758,6 +803,35 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
+  test("a reused session delivers late output only to its latest ACP context", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const first = createContext();
+    const second = createContext();
+    try {
+      const session = await openSession(agent, first.context);
+      await agent.prompt({
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }],
+      }, first.context);
+      await agent.loadSession({
+        sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [],
+      }, second.context);
+      server.sendBackgroundReply("AFTER_RELOAD");
+      await Bun.sleep(30);
+      const late = (updates: WireMessage[]) => updates.filter((update) =>
+        (update.content as { text?: string } | undefined)?.text === "AFTER_RELOAD",
+      );
+      expect(late(first.updates)).toHaveLength(0);
+      expect(late(second.updates)).toHaveLength(1);
+      agent.shutdown();
+      server.sendBackgroundReply("AFTER_SHUTDOWN");
+      await Bun.sleep(10);
+      expect(second.updates.some((update) =>
+        (update.content as { text?: string } | undefined)?.text === "AFTER_SHUTDOWN",
+      )).toBe(false);
+    } finally { agent.shutdown(); }
+  });
+
   test("delivery survives an expired premature-result grace window", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server, { prematureResultGraceMs: 5 });
@@ -921,22 +995,594 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
+  test("new sessions initialize without fetching bootstrap history", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
 
+    try {
+      await openSession(agent, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.historyRequests).toEqual([]);
+    } finally {
+      agent.shutdown();
+    }
+  });
 
+  test("cold loads fetch history once and repeated healthy loads reuse the runtime", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const params = {
+      sessionId: "conv-existing",
+      cwd: "/tmp/letta-acp-test",
+      mcpServers: [],
+    };
 
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.loadSession(params, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.historyRequests).toHaveLength(1);
+      expect(server.historyRequests[0]).toMatchObject({ conversation_id: params.sessionId });
+      const closedBeforeReload = server.closedSockets;
 
+      for (let index = 0; index < 3; index += 1) {
+        await agent.loadSession(params, context);
+        expect(server.historyRequests).toHaveLength(index + 2);
+        expect(server.runtimeStartRequestIds).toHaveLength(1);
+        expect(server.closedSockets).toBe(closedBeforeReload);
+      }
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.providerRequests).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
 
+  test("loading a newly created session reuses its runtime and model catalog", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
 
+    try {
+      const session = await openSession(agent, context);
+      const closedBeforeLoad = server.closedSockets;
+      await agent.loadSession({
+        sessionId: session.sessionId,
+        cwd: "/tmp/letta-acp-test",
+        mcpServers: [],
+      }, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.historyRequests).toHaveLength(1);
+      expect(server.closedSockets).toBe(closedBeforeLoad);
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.providerRequests).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
 
+  test("changed cwd reopens the runtime and closes the displaced sockets", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const params = { sessionId: "conv-existing", cwd: "/tmp/letta-acp-test", mcpServers: [] };
 
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.loadSession(params, context);
+      const closedBeforeReload = server.closedSockets;
+      await agent.loadSession({ ...params, cwd: "/tmp/letta-acp-other" }, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(2);
+      expect(server.closedSockets).toBeGreaterThan(closedBeforeReload);
+      expect(server.historyRequests).toHaveLength(2);
+      const closedAfterReload = server.closedSockets;
+      await agent.loadSession({ ...params, cwd: "/tmp/letta-acp-other" }, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(2);
+      expect(server.closedSockets).toBe(closedAfterReload);
+    } finally {
+      agent.shutdown();
+    }
+  });
 
+  test("changed filesystem capabilities reopen the runtime and close displaced sockets", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const params = { sessionId: "conv-existing", cwd: "/tmp/letta-acp-test", mcpServers: [] };
 
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.loadSession(params, context);
+      const closedBeforeReload = server.closedSockets;
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+      });
+      await agent.loadSession(params, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(2);
+      expect(server.closedSockets).toBeGreaterThan(closedBeforeReload);
+      expect(server.historyRequests).toHaveLength(2);
+      const closedAfterReload = server.closedSockets;
+      await agent.loadSession(params, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(2);
+      expect(server.closedSockets).toBe(closedAfterReload);
+    } finally {
+      agent.shutdown();
+    }
+  });
 
+  test("reload preserves permission and model selections without rediscovery or redundant updates", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const params = { sessionId: "conv-existing", cwd: "/tmp/letta-acp-test", mcpServers: [] };
 
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.loadSession(params, context);
+      await agent.setSessionConfigOption({
+        sessionId: params.sessionId, configId: "permissions", value: "acceptEdits",
+      });
+      await agent.setSessionConfigOption({
+        sessionId: params.sessionId, configId: "model", value: "other-model",
+      });
+      const closedBeforeReload = server.closedSockets;
+      const result = await agent.loadSession(params, context);
+      expect(result.modes?.currentModeId).toBe("acceptEdits");
+      expect(result.configOptions?.find((option) => option.id === "permissions"))
+        .toMatchObject({ currentValue: "acceptEdits" });
+      expect(result.configOptions?.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "other-model" });
+      await agent.setSessionConfigOption({
+        sessionId: params.sessionId, configId: "model", value: "other-model",
+      });
+      expect(server.updatedModelPayloads).toEqual([{ model_id: "other-model" }]);
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.providerRequests).toHaveLength(1);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.closedSockets).toBe(closedBeforeReload);
+    } finally {
+      agent.shutdown();
+    }
+  });
 
+  test("disconnected sessions fall back to a new runtime on load", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const params = { sessionId: "conv-existing", cwd: "/tmp/letta-acp-test", mcpServers: [] };
 
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.loadSession(params, context);
+      server.closeSockets();
+      const closedBeforeReload = server.closedSockets;
+      expect(closedBeforeReload).toBeGreaterThan(0);
+      await agent.loadSession(params, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(2);
+      expect(server.historyRequests).toHaveLength(2);
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.providerRequests).toHaveLength(2);
+      const result = await agent.prompt({
+        sessionId: params.sessionId, prompt: [{ type: "text", text: "hello" }],
+      }, context);
+      expect(result).toEqual({ stopReason: "end_turn" });
+    } finally {
+      agent.shutdown();
+    }
+  });
 
+  test("concurrent loads open one runtime and fetch history for each caller", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const params = { sessionId: "conv-existing", cwd: "/tmp/letta-acp-test", mcpServers: [] };
 
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const results = await Promise.all([
+        agent.loadSession(params, context),
+        agent.loadSession(params, context),
+        agent.loadSession(params, context),
+      ]);
+      expect(results).toHaveLength(3);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.historyRequests).toHaveLength(3);
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.providerRequests).toHaveLength(1);
+      expect(server.closedSockets).toBe(0);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("reload during an active prompt rejects without closing its runtime", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      const started = server.nextCancelablePrompt();
+      const prompt = agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "cancel active prompt" }],
+      }, context);
+      await started;
+      try {
+        const closedBeforeReload = server.closedSockets;
+        await expect(agent.loadSession({
+          sessionId: session.sessionId, cwd: "/tmp/letta-acp-other", mcpServers: [],
+        }, context)).rejects.toThrow("during an active prompt");
+        expect(server.closedSockets).toBe(closedBeforeReload);
+        expect(server.runtimeStartRequestIds).toHaveLength(1);
+        expect(server.historyRequests).toHaveLength(0);
+      } finally {
+        await agent.cancel({ sessionId: session.sessionId });
+        expect(await prompt).toEqual({ stopReason: "cancelled" });
+      }
+      await agent.loadSession({
+        sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [],
+      }, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.historyRequests).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("failed model discovery is evicted so the next load retries", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const params = { sessionId: "conv-existing", cwd: "/tmp/letta-acp-test", mcpServers: [] };
+    server.modelFailuresRemaining = 1;
+
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await expect(agent.loadSession(params, context)).rejects.toThrow("model discovery failed");
+      expect(server.modelRequests).toHaveLength(1);
+      const result = await agent.loadSession(params, context);
+      expect(result.configOptions?.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-model" });
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.providerRequests).toHaveLength(2);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.closedSockets).toBe(0);
+      expect(server.historyRequests).toHaveLength(2);
+      await agent.loadSession(params, context);
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.providerRequests).toHaveLength(2);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("same-handle context-window variants still send a model update", async () => {
+    const server = new FakeAppServer();
+    server.modelEntries = [
+      { id: "test-128k", handle: "test/model", label: "Test 128K", description: "", updateArgs: { context_window: 128_000 } },
+      { id: "test-1m", handle: "test/model", label: "Test 1M", description: "", updateArgs: { context_window: 1_000_000 } },
+    ];
+    const agent = createAgent(server);
+    const { context } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      expect(session.configOptions?.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-128k", options: [{
+          group: "test", name: "Test", options: [
+            { value: "test-128k", name: "Test 128K" },
+            { value: "test-1m", name: "Test 1M" },
+          ],
+        }] });
+      await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test-128k",
+      });
+      // Readiness reports only the shared handle: the inferred first variant
+      // must not suppress an explicit request until its identity is confirmed.
+      expect(server.updatedModelPayloads).toEqual([{ model_id: "test-128k" }]);
+      const changed = await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test-1m",
+      });
+      expect(changed.configOptions.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-1m" });
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "test-128k" }, { model_id: "test-1m" },
+      ]);
+      const restored = await agent.loadSession({
+        sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [],
+      }, context);
+      expect(restored.configOptions?.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-1m" });
+      await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test-1m",
+      });
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "test-128k" }, { model_id: "test-1m" },
+      ]);
+      const switchedBack = await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test-128k",
+      });
+      expect(switchedBack.configOptions.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-128k" });
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "test-128k" }, { model_id: "test-1m" }, { model_id: "test-128k" },
+      ]);
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.providerRequests).toHaveLength(1);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("concurrent config requests coalesce an in-flight model discovery", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let now = 1_000;
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
+    let releaseModels!: () => void;
+    let requests: Array<ReturnType<LettaAcpAgent["setSessionConfigOption"]>> = [];
+
+    try {
+      const session = await openSession(agent, context);
+      now += 30_000;
+      server.modelResponseGate = new Promise((resolve) => { releaseModels = resolve; });
+      const started = server.nextModelRequest();
+      requests = Array.from({ length: 3 }, () => agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test-model",
+      }));
+      await started;
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.providerRequests).toHaveLength(2);
+      releaseModels();
+      const results = await Promise.all(requests);
+      for (const result of results) {
+        expect(result.configOptions.find((option) => option.id === "model"))
+          .toMatchObject({ currentValue: "test-model" });
+      }
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.providerRequests).toHaveLength(2);
+      expect(server.updatedModelPayloads).toEqual([]);
+    } finally {
+      releaseModels?.();
+      await Promise.allSettled(requests);
+      clock.mockRestore();
+      agent.shutdown();
+    }
+  });
+
+  test("a successful model mutation stays committed when post-update discovery fails", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let now = 1_000;
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
+
+    try {
+      const session = await openSession(agent, context);
+      server.onModelUpdateResponse = () => {
+        now += 30_001;
+        server.modelFailuresRemaining = 1;
+        server.onModelUpdateResponse = undefined;
+      };
+      await expect(agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "other-model",
+      })).rejects.toThrow("model discovery failed");
+      expect(server.updatedModelPayloads).toEqual([{ model_id: "other-model" }]);
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.modelFailuresRemaining).toBe(0);
+
+      const corrected = await agent.setSessionConfigOption({
+        sessionId: session.sessionId, configId: "model", value: "test-model",
+      });
+      expect(server.updatedModelPayloads).toEqual([
+        { model_id: "other-model" },
+        { model_id: "test-model" },
+      ]);
+      expect(corrected.configOptions.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-model" });
+      expect(server.modelRequests).toHaveLength(3);
+      expect(server.providerRequests).toHaveLength(3);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+    } finally {
+      server.onModelUpdateResponse = undefined;
+      clock.mockRestore();
+      agent.shutdown();
+    }
+  });
+
+  test("prompt during a blocked load rejects without disrupting the load", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let releaseModels!: () => void;
+    server.modelResponseGate = new Promise((resolve) => { releaseModels = resolve; });
+    let load: ReturnType<LettaAcpAgent["loadSession"]> | undefined;
+    const params = { sessionId: "conv-existing", cwd: "/tmp/letta-acp-test", mcpServers: [] };
+
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const started = server.nextModelRequest();
+      load = agent.loadSession(params, context);
+      await started;
+      const closedBeforePrompt = server.closedSockets;
+      await expect(agent.prompt({
+        sessionId: params.sessionId, prompt: [{ type: "text", text: "plain prompt" }],
+      }, context)).rejects.toThrow("while it is loading");
+      expect(server.closedSockets).toBe(closedBeforePrompt);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.historyRequests).toHaveLength(1);
+
+      releaseModels();
+      expect((await load).configOptions?.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-model" });
+      expect(await agent.prompt({
+        sessionId: params.sessionId, prompt: [{ type: "text", text: "plain prompt" }],
+      }, context)).toEqual({ stopReason: "end_turn" });
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.closedSockets).toBe(closedBeforePrompt);
+    } finally {
+      releaseModels();
+      if (load) await Promise.allSettled([load]);
+      agent.shutdown();
+    }
+  });
+
+  test("model discovery cache expires at its TTL and refreshes catalog options", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let now = 1_000;
+    const clock = spyOn(performance, "now").mockImplementation(() => now);
+
+    try {
+      const session = await openSession(agent, context);
+      const params = { sessionId: session.sessionId, configId: "model", value: "test-model" };
+      server.modelEntries = [...server.modelEntries, {
+        id: "new-model", handle: "test/new-model", label: "New Model", description: "",
+      }];
+      now += 29_999;
+      const cached = await agent.setSessionConfigOption(params);
+      expect(cached.configOptions.find((option) => option.id === "model"))
+        .toEqual(session.configOptions?.find((option) => option.id === "model"));
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.providerRequests).toHaveLength(1);
+      now += 1;
+      const refreshed = await agent.setSessionConfigOption(params);
+      expect(refreshed.configOptions.find((option) => option.id === "model"))
+        .toMatchObject({ options: [{ group: "test", options: [
+          { value: "test-model" }, { value: "other-model" }, { value: "new-model" },
+        ] }] });
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.providerRequests).toHaveLength(2);
+      now += 29_999;
+      await agent.setSessionConfigOption(params);
+      expect(server.modelRequests).toHaveLength(2);
+      expect(server.providerRequests).toHaveLength(2);
+      expect(server.updatedModelPayloads).toEqual([]);
+    } finally {
+      clock.mockRestore();
+      agent.shutdown();
+    }
+  });
+
+  test("a reused session routes late permissions to the updated ACP context", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const original = createContext({ permissionOptionId: "reject_once" });
+    const replacement = createContext({ permissionOptionId: "allow_once" });
+
+    try {
+      const session = await openSession(agent, original.context);
+      expect(await agent.prompt({
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }],
+      }, original.context)).toEqual({ stopReason: "end_turn" });
+      const closedBeforeReload = server.closedSockets;
+      await agent.loadSession({
+        sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [],
+      }, replacement.context);
+      const approval = server.nextApprovalResponse();
+      server.requestPermissionAfterPrompt();
+      expect(await approval).toMatchObject({
+        request_id: "approval-request-after-prompt", decision: { behavior: "allow" },
+      });
+      expect(original.permissionRequests).toEqual([]);
+      expect(replacement.permissionRequests).toHaveLength(1);
+      expect(replacement.permissionRequests[0]).toMatchObject({
+        sessionId: session.sessionId,
+        toolCall: { title: "Show working directory after prompt" },
+      });
+      expect(replacement.permissionSignals[0]).toBeInstanceOf(AbortSignal);
+      expect(server.runtimeStartRequestIds).toHaveLength(1);
+      expect(server.closedSockets).toBe(closedBeforeReload);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("changed local MCP settings reopen the runtime and terminate the displaced subprocess", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "letta-acp-mcp-reload-"));
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    const firstMarker = join(directory, "first-closed");
+    const secondMarker = join(directory, "second-closed");
+    const mcpServer = (marker: string): McpServer => ({
+      name: "local-test",
+      command: process.execPath,
+      args: [join(import.meta.dir, "fixtures", "stubborn-mcp-server.ts")],
+      env: [{ name: "MCP_SHUTDOWN_MARKER", value: marker }],
+    });
+    const waitForShutdown = async (marker: string) => {
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const content = await readFile(marker, "utf8").catch(() => null);
+        if (content === "terminated") return;
+        await Bun.sleep(10);
+      }
+      throw new Error(`MCP subprocess did not terminate: ${marker}`);
+    };
+    let secondStarted = false;
+
+    try {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      const params = { sessionId: "conv-existing", cwd: directory, mcpServers: [mcpServer(firstMarker)] };
+      await agent.loadSession(params, context);
+      const closedBeforeReload = server.closedSockets;
+      const changed = { ...params, mcpServers: [mcpServer(secondMarker)] };
+      await agent.loadSession(changed, context);
+      secondStarted = true;
+      expect(server.runtimeStartRequestIds).toHaveLength(2);
+      expect(server.closedSockets).toBeGreaterThan(closedBeforeReload);
+      await waitForShutdown(firstMarker);
+      const closedAfterReload = server.closedSockets;
+      await agent.loadSession(changed, context);
+      expect(server.runtimeStartRequestIds).toHaveLength(2);
+      expect(server.closedSockets).toBe(closedAfterReload);
+      expect(server.historyRequests).toHaveLength(3);
+    } finally {
+      agent.shutdown();
+      try {
+        if (secondStarted) await waitForShutdown(secondMarker);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+  }, 10_000);
+
+  test("bounds session discovery lookups to one registry page", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "letta-acp-list-page-"));
+    const scope = "pagination-test";
+    const registry = new SessionRegistry(directory, scope);
+    const cwd = "/tmp/letta-acp-test";
+    for (let index = 0; index < 51; index += 1) {
+      await registry.record("agent-test", `conv-page-${String(index).padStart(2, "0")}`, cwd);
+    }
+
+    const server = new FakeAppServer();
+    const agent = createAgent(server, {
+      sessionRegistryDir: directory,
+      sessionRegistryScope: scope,
+    });
+    try {
+      const first = await agent.listSessions({ cwd });
+      expect(first.sessions).toHaveLength(50);
+      expect(first.nextCursor).toBeString();
+      expect(server.conversationRetrieveIds).toHaveLength(50);
+
+      const second = await agent.listSessions({ cwd, cursor: first.nextCursor });
+      expect(second.sessions).toHaveLength(1);
+      expect(second.nextCursor).toBeUndefined();
+      expect(server.conversationRetrieveIds).toHaveLength(51);
+    } finally {
+      agent.shutdown();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 
   test("removes archived and foreign sessions but retains unavailable records", async () => {
     const directory = await mkdtemp(join(tmpdir(), "letta-acp-list-stale-"));
@@ -989,6 +1635,61 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
+  test("advertises available models in the session configuration", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+
+      expect(session.configOptions).toEqual([
+        {
+          id: "permissions",
+          name: "Permissions",
+          description: "Approval behavior for tool calls",
+          category: "mode",
+          type: "select",
+          currentValue: "standard",
+          options: [
+            expect.objectContaining({ value: "standard", name: "Ask before edits" }),
+            expect.objectContaining({ value: "acceptEdits", name: "Accept edits" }),
+            expect.objectContaining({
+              value: "unrestricted",
+              name: "Bypass permissions",
+            }),
+          ],
+        },
+        {
+          id: "model",
+          name: "Model",
+          description: "Model used for this Letta session",
+          category: "model",
+          type: "select",
+          currentValue: "test-model",
+          options: [{
+            group: "test",
+            name: "Test",
+            options: [
+              {
+                value: "test-model",
+                name: "Test Model",
+                description: "Deterministic test model",
+              },
+              {
+                value: "other-model",
+                name: "Other Model",
+                description: "Alternate deterministic model",
+              },
+            ],
+          }],
+        },
+      ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
   test("switches models through session configuration options", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server);
@@ -996,6 +1697,14 @@ describe("Agent SDK app-server integration", () => {
 
     try {
       const session = await openSession(agent, context);
+      const unchanged = await agent.setSessionConfigOption({
+        sessionId: session.sessionId,
+        configId: "model",
+        value: "test-model",
+      });
+      expect(unchanged.configOptions.find((option) => option.id === "model"))
+        .toMatchObject({ currentValue: "test-model" });
+      expect(server.updatedModelPayloads).toEqual([]);
       const result = await agent.setSessionConfigOption({
         sessionId: session.sessionId,
         configId: "model",
@@ -1003,6 +1712,8 @@ describe("Agent SDK app-server integration", () => {
       });
 
       expect(server.updatedModelPayloads).toEqual([{ model_id: "other-model" }]);
+      expect(server.modelRequests).toHaveLength(1);
+      expect(server.providerRequests).toHaveLength(1);
       expect(
         result.configOptions.find((option) => option.id === "model"),
       ).toMatchObject({

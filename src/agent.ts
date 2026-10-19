@@ -110,18 +110,27 @@ interface AcpSessionState {
   modeId: PermissionMode;
   /** Session working directory (for project skill discovery). */
   cwd: string;
-  /** Model handle reported by the runtime, updated after ACP model changes. */
+  /** Runtime model handle, or selected catalog id (preserves context variants). */
   currentModel: string | undefined;
   /** Reasoning tier selected over ACP; validated against the model catalog. */
   reasoningEffort: string | undefined;
+  /** Reuse only when runtime-bound cwd, MCP servers and editor tools match. */
+  runtimeConfigKey: string;
   reader: SessionReader | null;
   promptEvents: PromptEvents | null;
+  /** Cached model catalog, shared by every config request in its TTL window. */
+  modelCatalog?: {
+    expiresAt: number;
+    promise: Promise<Awaited<ReturnType<LettaCodeSession["listModels"]>>["entries"]>;
+  };
 }
 
 /** Max history messages replayed on session/load. */
 const LOAD_HISTORY_LIMIT = 200;
 /** Number of project sessions returned in one session/list page. */
 const SESSION_LIST_PAGE_SIZE = 50;
+/** Coalesce Zed's load/config restoration requests without hiding changes indefinitely. */
+const MODEL_CATALOG_TTL_MS = 30_000;
 
 /**
  * Liveness bound for permission requests raised outside a prompt turn.
@@ -175,6 +184,7 @@ export class LettaAcpAgent {
   private readonly activeRunSilenceMs: number;
   private readonly sessionRegistry: SessionRegistry;
   private readonly sessions = new Map<string, AcpSessionState>();
+  private readonly sessionLoads = new Map<string, Promise<LoadSessionResponse>>();
   private agentIdPromise: Promise<string> | null = null;
   private supportsTerminalOutput = false;
   private clientFsCaps: EditorFsCapabilities = {
@@ -252,6 +262,25 @@ export class LettaAcpAgent {
   }
 
   async loadSession(
+    params: LoadSessionRequest,
+    cx: AgentContext,
+  ): Promise<LoadSessionResponse> {
+    // Keep concurrent loads from opening duplicate runtimes or interleaving replay.
+    // A failed load must not prevent the next queued load from retrying.
+    const previous = this.sessionLoads.get(params.sessionId);
+    const pending = (previous ?? Promise.resolve())
+      .catch(() => {})
+      .then(() => this.loadSessionOnce(params, cx));
+    const tracked = pending.finally(() => {
+      if (this.sessionLoads.get(params.sessionId) === tracked) {
+        this.sessionLoads.delete(params.sessionId);
+      }
+    });
+    this.sessionLoads.set(params.sessionId, tracked);
+    return tracked;
+  }
+
+  private async loadSessionOnce(
     params: LoadSessionRequest,
     cx: AgentContext,
   ): Promise<LoadSessionResponse> {
@@ -426,27 +455,55 @@ export class LettaAcpAgent {
     }
   }
 
+  /**
+   * Zed fires several config requests back to back when it restores a session,
+   * and discovery asks the runtime for its catalog and then for connected
+   * providers each time. Share one in-flight discovery across all callers and
+   * keep the result for a short window. A window rather than a permanent cache
+   * keeps a newly connected provider visible without restarting the adapter.
+   */
+  private async sessionModels(state: AcpSessionState) {
+    if (state.modelCatalog && performance.now() < state.modelCatalog.expiresAt) {
+      return state.modelCatalog.promise;
+    }
+    const cached = {
+      expiresAt: Infinity,
+      promise: (async () => {
+        const [{ entries }, connected] = await Promise.all([
+          state.session.listModels(),
+          this.connectedProviderNames(state.session),
+        ]);
+        const catalog = [
+          ...new Map(entries.map((entry) => [entry.id, entry])).values(),
+        ];
+        // Unknown provider state retains the full catalog rather than hiding models.
+        const models = connected
+          ? catalog.filter((entry) => isUsableModel(entry, connected))
+          : catalog;
+        if (connected) {
+          log(
+            `models: ${models.length}/${catalog.length} usable ` +
+              `(${connected.size} connected providers: ${[...connected].sort().join(", ")})`,
+          );
+        }
+        return models;
+      })(),
+    };
+    state.modelCatalog = cached;
+    try {
+      const models = await cached.promise;
+      cached.expiresAt = performance.now() + MODEL_CATALOG_TTL_MS;
+      return models;
+    } catch (error) {
+      if (state.modelCatalog === cached) state.modelCatalog = undefined;
+      throw error;
+    }
+  }
+
   private async sessionConfigOptions(
     state: AcpSessionState,
   ): Promise<SessionConfigOption[]> {
-    const { entries } = await state.session.listModels();
-    const catalog = [
-      ...new Map(entries.map((entry) => [entry.id, entry])).values(),
-    ];
-    // Offer only models the runtime can actually serve: those from connected
-    // providers plus Letta's built-ins. Asked of the runtime's own provider
-    // store so self-hosted backends filter too; if it cannot answer, show the
-    // whole catalog rather than hide every model.
-    const connected = await this.connectedProviderNames(state.session);
-    const models = connected
-      ? catalog.filter((entry) => isUsableModel(entry, connected))
-      : catalog;
-    if (connected) {
-      log(
-        `models: ${models.length}/${catalog.length} usable ` +
-          `(${connected.size} connected providers: ${[...connected].sort().join(", ")})`,
-      );
-    }
+    const models = await this.sessionModels(state);
 
     // Collapse each model variant to one row and group rows by provider. Reasoning
     // tiers are separate catalog entries, but the tier is picked through the
@@ -518,8 +575,24 @@ export class LettaAcpAgent {
       if (typeof params.value !== "string") {
         throw new Error("The model configuration option requires a model id");
       }
+      const configOptions = await this.sessionConfigOptions(state);
+      const selected = configOptions.find((option) => option.id === "model");
+      const models = await this.sessionModels(state);
+      // A handle alone cannot confirm which context-window variant is active.
+      // Only suppress restoration when the selection is known, not inferred.
+      const selectionKnown = models.some((entry) => entry.id === state.currentModel) ||
+        collapseVariants(models).filter((entry) => entry.handle === state.currentModel).length === 1;
+      if (
+        selectionKnown &&
+        (params.value === state.currentModel || params.value === selected?.currentValue)
+      ) {
+        return { configOptions };
+      }
       const result = await state.session.updateModel(params.value);
-      state.currentModel = result.modelHandle ?? result.modelId ?? params.value;
+      // Commit the successful mutation before any later discovery can fail.
+      state.currentModel = models.some((entry) => entry.id === params.value)
+        ? params.value
+        : result.modelHandle ?? result.modelId ?? params.value;
       // A new model may not offer the previous tier; let the catalog decide.
       state.reasoningEffort = undefined;
       log(`session ${params.sessionId} model -> ${state.currentModel}`);
@@ -583,6 +656,28 @@ export class LettaAcpAgent {
     clientContext: AgentContext;
     mcpServers?: readonly McpServer[];
   }): Promise<{ sessionId: string; state: AcpSessionState }> {
+    const runtimeConfigKey = JSON.stringify([
+      options.cwd,
+      toSdkMcpServers(options.mcpServers),
+      this.clientFsCaps,
+    ]);
+    const existing = options.resumeId
+      ? this.sessions.get(options.resumeId)
+      : undefined;
+    if (existing?.promptActive) {
+      throw new Error(`Cannot load session ${options.resumeId} during an active prompt`);
+    }
+    if (existing?.runtimeConfigKey === runtimeConfigKey) {
+      try {
+        const ready = await existing.session.ready();
+        existing.clientContext = options.clientContext;
+        return { sessionId: ready.conversationId, state: existing };
+      } catch (error) {
+        log(`reopening unavailable session ${options.resumeId}: ${String(error)}`);
+        existing.reader?.stop();
+        existing.session.close();
+      }
+    }
     const ref = { sessionId: options.resumeId ?? "" };
     const editorTools = createEditorTools(this.clientFsCaps, {
       getSessionId: () => ref.sessionId,
@@ -611,8 +706,15 @@ export class LettaAcpAgent {
     const session = options.resumeId
       ? this.client.resumeSession(options.resumeId, sessionOptions)
       : this.client.createSession(options.agentId ?? "", sessionOptions);
-    // Force runtime initialization so the conversation id and active model exist.
-    const bootstrap = await session.bootstrapState({ limit: 1 });
+    // ready() initializes the runtime without fetching a redundant history page.
+    const bootstrap = await (async () => {
+      try {
+        return await session.ready();
+      } catch (error) {
+        session.close();
+        throw error;
+      }
+    })();
     const sessionId = options.resumeId ?? session.conversationId;
     if (!sessionId) {
       session.close();
@@ -636,6 +738,7 @@ export class LettaAcpAgent {
       cwd: options.cwd,
       currentModel: bootstrap.model ?? this.config.model,
       reasoningEffort: undefined,
+      runtimeConfigKey,
       reader: null,
       promptEvents: null,
     };
@@ -681,9 +784,10 @@ export class LettaAcpAgent {
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
     }
-    if (state.promptActive) {
-      throw new Error(`Session ${params.sessionId} already has an active prompt`);
+    if (this.sessionLoads.has(params.sessionId)) {
+      throw new Error(`Cannot prompt session ${params.sessionId} while it is loading`);
     }
+    if (state.promptActive) throw new Error(`Session ${params.sessionId} already has an active prompt`);
     const reader = this.startReader(params.sessionId, state);
     const events = reader.observe();
     state.promptEvents = events;
