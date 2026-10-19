@@ -13,6 +13,7 @@
  *   LETTA_AGENT_ID             reuse an existing agent (recommended)
  *   LETTA_ACP_MODEL            optional model override (new agents default letta/auto)
  *   LETTA_ACP_PERMISSION_MODE  standard (default) | acceptEdits | unrestricted
+ *   LETTA_ACP_DEBUG            opt-in label for stderr turn-lifecycle tracing
  */
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";

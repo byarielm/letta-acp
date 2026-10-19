@@ -38,6 +38,7 @@ import {
 } from "@letta-ai/letta-agent-sdk";
 import { authMethodsForClient } from "./auth.js";
 import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
+import { debug } from "./debug.js";
 import {
   createEditorTools,
   type EditorFsCapabilities,
@@ -208,6 +209,7 @@ export class LettaAcpAgent {
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
+    debug({ ev: "initialize", backend: this.config.clientOptions.backend ?? "local" });
     const fs = params.clientCapabilities?.fs;
     this.supportsTerminalOutput =
       params.clientCapabilities?._meta?.terminal_output === true;
@@ -755,6 +757,7 @@ export class LettaAcpAgent {
   }
 
   private startReader(sessionId: string, state: AcpSessionState): SessionReader {
+    if (!state.reader) debug({ ev: "reader_start", sessionId });
     state.reader ??= new SessionReader(
       state.session,
       (message) => this.forwardMessage(sessionId, state, message, state.clientContext),
@@ -810,13 +813,41 @@ export class LettaAcpAgent {
       let mode: "turn" | "recovery" = "turn";
       let graceMs: number | undefined;
       let pendingRunIds: readonly string[] = [];
+      let round = 0;
       while (true) {
+        round += 1;
         const outcome = await this.pumpStream(
           params.sessionId,
           state,
           mode,
           graceMs,
         );
+        // The round's outcome is the one fact the byte stream cannot show: the
+        // client only sees the notifications that came out of it, so a turn
+        // that ends early and a turn whose work never arrived look identical.
+        // Record what the pump decided and on what evidence, before acting on it.
+        debug({
+          ev: "round",
+          sessionId: params.sessionId,
+          round,
+          mode,
+          graceMs: graceMs ?? null,
+          outcome: outcome.kind,
+          ...(outcome.kind === "premature" || outcome.kind === "result"
+            ? {
+                success: outcome.result.success,
+                stopReason: outcome.result.stopReason ?? null,
+                errorCode: outcome.result.errorCode ?? null,
+                runIds: outcome.result.runIds ?? [],
+              }
+            : {}),
+          ...(outcome.kind === "stream_end"
+            ? {
+                activeRunIds: outcome.activeRunIds,
+                sawActivity: outcome.sawActivity,
+              }
+            : {}),
+        });
         if (state.cancelled) return { stopReason: "cancelled" };
         switch (outcome.kind) {
           case "premature": {
@@ -1039,6 +1070,14 @@ export class LettaAcpAgent {
     let sawActivity = false;
     let idleStatusCount = 0;
     let activeRunIds: readonly string[] = [];
+    const startedAt = performance.now();
+    // Record prompt coordination separately from session-wide delivery.
+    debug({
+      ev: "round_start",
+      sessionId,
+      mode,
+      deadlineMs: firstMessageDeadlineMs ?? null,
+    });
 
     let awaitingFirstMessage = true;
     while (true) {
@@ -1047,6 +1086,14 @@ export class LettaAcpAgent {
         awaitingFirstMessage ? firstMessageDeadlineMs : undefined,
       );
       if (!step) {
+        debug({
+          ev: "round_deadline",
+          sessionId,
+          mode,
+          waitedMs: firstMessageDeadlineMs,
+          sawActivity,
+          activeRunIds,
+        });
         log("no further activity during the grace round; ending turn");
         return { kind: "idle" };
       }
@@ -1095,6 +1142,26 @@ export class LettaAcpAgent {
         }
       }
       sawActivity = sawActivity || step.forwarded;
+    }
+    debug({
+      ev: "round_end",
+      sessionId,
+      mode,
+      elapsedMs: Math.round(performance.now() - startedAt),
+      sawActivity,
+      activeRunIds,
+    });
+    if (mode === "recovery" && !sawActivity) {
+      // The fork's silence window only re-arms a still-working run when the
+      // round produced activity, so an active run voice:false during one is a
+      // stale listing rather than work in progress — and it is also the exact
+      // case where a resolved turn strands late output out-of-turn.
+      debug({
+        ev: "round_silent",
+        sessionId,
+        activeRunIds,
+        note: "active runs listed but the round produced nothing",
+      });
     }
     return { kind: "stream_end", activeRunIds, sawActivity };
   }

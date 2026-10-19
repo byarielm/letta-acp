@@ -37,6 +37,12 @@ export interface LettaAcpConfig {
    * it delays the prompt response whenever a run is listed but idle.
    */
   activeRunSilenceMs?: number;
+  /**
+   * Opt-in. Labels stderr turn-lifecycle trace lines (`LETTA_ACP_DEBUG`); the
+   * value is echoed into each record so logs from different adapters or runs
+   * stay separable. Unset disables the channel, which is the shipping default.
+   */
+  debugLabel?: string;
 }
 
 const PERMISSION_MODES: PermissionMode[] = [
@@ -117,6 +123,7 @@ export function configFromEnv(
     env.LETTA_ACP_ACTIVE_RUN_SILENCE_MS ?? "",
     10,
   );
+  const debugLabel = env.LETTA_ACP_DEBUG?.trim();
 
   return {
     clientOptions,
@@ -126,6 +133,7 @@ export function configFromEnv(
     ...(Number.isFinite(activeRunSilenceMs) && activeRunSilenceMs > 0
       ? { activeRunSilenceMs }
       : {}),
+    ...(debugLabel ? { debugLabel } : {}),
     sessionRegistryDir:
       env.LETTA_ACP_STATE_DIR ?? join(homedir(), ".letta", "letta-acp", "sessions"),
     sessionRegistryScope,
