@@ -70,6 +70,16 @@ To drive a **Letta Cloud** agent from Zed without putting an API key in `setting
 }
 ```
 
+### Thread loading and diagnostics
+
+Loading a conversation already open in the same adapter process reuses its healthy runtime and MCP connections when the working directory, MCP settings, and editor filesystem capabilities match. Its permission choices, model variant, and reasoning tier are retained; history is fetched again so the editor receives an up-to-date transcript. Changed settings or disconnected sessions reopen the runtime. Loads for one conversation are serialized; loading during an active prompt is rejected rather than interrupting that turn.
+
+Model/provider discovery is fetched concurrently and cached per session for 30 seconds, including in-flight requests. The picker is rebuilt from the current session selections, and failed catalog requests are retried on the next request. Provider or catalog changes become visible on the next configuration request after the cache expires. Restoring a confirmed unchanged model does not reset its reasoning tier or send a redundant backend update. If the runtime reports only a handle shared by multiple context-window variants, an explicit selection still updates the backend rather than assuming which variant is active.
+
+Adapter stderr (also visible in Zed's log) includes `timing:` entries for runtime initialization/reuse, history fetch/replay, model/provider discovery, and total new/load time. Cold sessions still need to start the SDK runtime and connect MCP servers. These timings distinguish that cost from transcript and picker work.
+
+When a source-checkout launcher uses `dist/index.js`, run `bun run build` after changing source and restart the external-agent process (restarting Zed also does this). Already-running adapter processes do not reload compiled changes.
+
 ## Configuration
 
 The adapter reaches Letta through one of four backends, selected with `LETTA_ACP_BACKEND` ([self-hosting docs](https://docs.letta.com/self-hosting)). Each subsection below shows the full `env` block for that backend.
@@ -135,6 +145,16 @@ Point the adapter at an app server you run (`letta server --backend local --list
 | `LETTA_ACP_MODEL` | optional model override for sessions, as a `provider/model` handle (e.g. `anthropic/claude-fable-5`, `openai/gpt-4.1`); new agents default to `letta/auto`, while reused agents keep their model when this is unset — run `/model` to list valid handles |
 | `LETTA_ACP_PERMISSION_MODE` | initial session mode: `standard` (default), `acceptEdits`, `unrestricted` — switchable live via `session/set_mode` (Zed's mode dropdown) |
 
+### Turn-lifecycle tracing
+
+`LETTA_ACP_DEBUG=<label>` labels stderr trace lines for initialization, reader startup, and turn coordination — one JSON record per stream round, carrying the pump outcome, the round's mode and deadline, the server's active-run list, and whether the round produced output, plus a `round: N` counter that ties them to a single prompt. It exists because the coordination decisions happen inside the adapter: an ACP log shows the notifications a turn emitted, but not whether the turn ended early, or why a still-working run was or wasn't waited on.
+
+```
+[letta-acp:debug] philo {"ev":"round","round":2,"mode":"recovery","outcome":"stream_end",...}
+```
+
+Off by default. Records go to stderr, never ACP stdout. Logging can still add timing overhead; it is a diagnostic channel, not a timing-neutral instrument.
+
 Note on tool execution: with `remote` and `cloud`, built-in tools (Read, Bash, …) run where the harness runs — the server/sandbox filesystem, not your machine. With `local` and `cloud-oauth` they run on your machine. The editor fs tools (`read_editor_buffer`, `write_via_editor`) always operate on the editor's files regardless of backend, since they execute in the adapter and delegate to the ACP client.
 
 ## What's implemented
@@ -175,7 +195,7 @@ The rest of the CLI's commands (`/agents`, `/resume`, `/login`, `/statusline`, `
 `src/agent.ts` maps the two protocols:
 
 - Each ACP session becomes a new conversation (`client.createSession`) on one underlying Letta agent, with the ACP `cwd`.
-- `session/prompt` sends the message and pumps `session.stream()`, translating SDK messages (`assistant`, `reasoning`, `tool_call`, `tool_result`) into `session/update` notifications.
+- A single session-owned reader translates SDK messages (`assistant`, `reasoning`, `tool_call`, `tool_result`) into `session/update` notifications, including background output after a prompt completes. `session/prompt` observes that reader for turn completion; it does not start a competing SDK consumer.
 - When the client advertises `_meta.terminal_output`, Bash calls use ACP terminal content plus `terminal_info`, `terminal_output`, and `terminal_exit` updates. Zed controls whether terminal cards start expanded or collapsed; the adapter sends the complete output and retains it in `rawOutput`.
 - Tool approvals: the SDK's `canUseTool` callback is forwarded as an ACP `session/request_permission` request. One Letta-specific wrinkle: the app-server transport ends the turn with a recoverable `approval_conflict` result while the approval is pending, and the resumed run streams without a second terminal result — so after such a result the adapter keeps pumping the stream (approvals resolve concurrently over the control channel) and ends the turn when the agent loop reports it is idle again.
 
