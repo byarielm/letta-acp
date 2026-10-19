@@ -52,6 +52,7 @@ import {
 import { planEntriesFrom, UPDATE_PLAN_TOOL } from "./plan.js";
 import { withAcpRequestTimeout } from "./request-timeout.js";
 import { SessionRegistry } from "./session-registry.js";
+import { type PromptEvents, SessionReader } from "./session-reader.js";
 import {
   editorReadAutoAllows,
   isSessionModeId,
@@ -113,6 +114,8 @@ interface AcpSessionState {
   currentModel: string | undefined;
   /** Reasoning tier selected over ACP; validated against the model catalog. */
   reasoningEffort: string | undefined;
+  reader: SessionReader | null;
+  promptEvents: PromptEvents | null;
 }
 
 /** Max history messages replayed on session/load. */
@@ -240,6 +243,7 @@ export class LettaAcpAgent {
     await this.rememberSession(agentId, sessionId, params.cwd);
     log(`session ${sessionId} -> agent ${agentId} (cwd: ${params.cwd})`);
     this.announceCommands(sessionId, cx);
+    this.startReader(sessionId, state);
     return {
       sessionId,
       modes: sessionModeState(state.modeId),
@@ -285,6 +289,7 @@ export class LettaAcpAgent {
     }
     log(`loaded session ${sessionId} (${updates.length} replayed updates)`);
     this.announceCommands(sessionId, cx);
+    this.startReader(sessionId, state);
     return {
       modes: sessionModeState(state.modeId),
       configOptions: await this.sessionConfigOptions(state),
@@ -631,16 +636,28 @@ export class LettaAcpAgent {
       cwd: options.cwd,
       currentModel: bootstrap.model ?? this.config.model,
       reasoningEffort: undefined,
+      reader: null,
+      promptEvents: null,
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
     // it so its sockets and per-session MCP subprocesses are not orphaned.
     const displaced = this.sessions.get(sessionId);
     if (displaced && displaced.session !== session) {
+      displaced.reader?.stop();
       displaced.session.close();
     }
     this.sessions.set(sessionId, state);
     return { sessionId, state };
+  }
+
+  private startReader(sessionId: string, state: AcpSessionState): SessionReader {
+    state.reader ??= new SessionReader(
+      state.session,
+      (message) => this.forwardMessage(sessionId, state, message, state.clientContext),
+      (error) => log(`session reader failed for ${sessionId}: ${String(error)}`),
+    );
+    return state.reader;
   }
 
   private announceCommands(sessionId: string, cx: AgentContext): void {
@@ -664,6 +681,12 @@ export class LettaAcpAgent {
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
     }
+    if (state.promptActive) {
+      throw new Error(`Session ${params.sessionId} already has an active prompt`);
+    }
+    const reader = this.startReader(params.sessionId, state);
+    const events = reader.observe();
+    state.promptEvents = events;
     state.clientContext = cx;
     state.cancelled = false;
     state.promptActive = true;
@@ -687,7 +710,6 @@ export class LettaAcpAgent {
         const outcome = await this.pumpStream(
           params.sessionId,
           state,
-          cx,
           mode,
           graceMs,
         );
@@ -715,13 +737,12 @@ export class LettaAcpAgent {
             return this.toPromptResponse(state, result);
           }
           case "idle":
-            // The round heard nothing for the whole window: the server really is
-            // quiet, so end rather than wait on a run that may never settle.
+            // Release the prompt after the grace window; the session reader
+            // still delivers later work without another user message.
             return { stopReason: "end_turn" };
           case "stream_end": {
-            // The SDK ended its stream, but a run the server still lists as active
-            // is not finished: resolving now would push whatever it produces next
-            // out-of-turn, where the client shows nothing until the next prompt.
+            // Preserve the existing grace policy for a stream ending while the
+            // server still lists active runs. Delivery no longer depends on it.
             // When enabled, stay with the run; the round's first-message deadline
             // becomes the silence window, and a round that says nothing still ends
             // the turn, so a stale run cannot hold it open indefinitely.
@@ -751,9 +772,9 @@ export class LettaAcpAgent {
       if (state.cancelled) return { stopReason: "cancelled" };
       throw error;
     } finally {
-      // The client context stays for the lifetime of the session; only the
-      // in-a-turn marker is cleared, so late tool traffic still reaches the
-      // client but waits on a deadline.
+      reader.release(events);
+      state.promptEvents = null;
+      // Delivery outlives this observer; late permissions use a finite deadline.
       state.promptActive = false;
     }
   }
@@ -844,11 +865,15 @@ export class LettaAcpAgent {
     });
 
     for (let round = 0; round < EXECUTE_COMMAND_MAX_ROUNDS; round++) {
-      // A cancel can land between stream rounds after a nested command turn
-      // produced its terminal result. Do not attach another stream listener
-      // once the command has already been aborted.
+      // A cancel can land between nested command results.
       if (state.cancelled) return { stopReason: "cancelled" };
-      for await (const message of state.session.stream()) {
+      while (true) {
+        const event = await state.promptEvents!.next();
+        if (!event || !event.message) {
+          if (event?.error) throw event.error;
+          throw new Error(`/${command} stream closed before completion`);
+        }
+        const message = event.message;
         if (state.cancelled) return { stopReason: "cancelled" };
         if (message.type === "stream_event") {
           const event = message.event as Record<string, unknown>;
@@ -883,20 +908,19 @@ export class LettaAcpAgent {
             message.success ||
             message.errorCode === "approval_conflict"
           ) {
-            continue;
+            break;
           }
           // Do not turn genuine nested-turn failures into 50 opaque recovery
           // rounds followed by "/<command> did not complete".
           return this.toPromptResponse(state, message);
         }
-        await this.forwardMessage(sessionId, state, message, cx);
       }
     }
     throw new Error(`/${command} did not complete`);
   }
 
   /**
-   * Iterates one session.stream() round, forwarding events to the client.
+   * Observes one turn round after the session reader delivers its events.
    * In "recovery" mode (post-approval continuation) there is no terminal
    * result message, so loop_status transitions decide when the turn is over.
    * Blocking on the stream while an approval is pending is fine — the
@@ -905,7 +929,6 @@ export class LettaAcpAgent {
   private async pumpStream(
     sessionId: string,
     state: AcpSessionState,
-    cx: AgentContext,
     mode: "turn" | "recovery",
     firstMessageDeadlineMs?: number,
   ): Promise<PumpOutcome> {
@@ -913,23 +936,22 @@ export class LettaAcpAgent {
     let idleStatusCount = 0;
     let activeRunIds: readonly string[] = [];
 
-    const stream = state.session.stream()[Symbol.asyncIterator]();
     let awaitingFirstMessage = true;
     while (true) {
-      const pending = stream.next();
-      // Only the first message of a grace round is raced: a server that went
-      // quiet after contradicting itself must not wedge the prompt.
-      const step =
-        awaitingFirstMessage && firstMessageDeadlineMs !== undefined
-          ? await raceDeadline(pending, firstMessageDeadlineMs)
-          : await pending;
+      // Expiring this observation must not leave a pending SDK read behind.
+      const step = await state.promptEvents!.next(
+        awaitingFirstMessage ? firstMessageDeadlineMs : undefined,
+      );
       if (!step) {
         log("no further activity during the grace round; ending turn");
         return { kind: "idle" };
       }
       awaitingFirstMessage = false;
-      if (step.done) break;
-      const message = step.value;
+      if (!step.message) {
+        if (step.error) throw step.error;
+        break;
+      }
+      const message = step.message;
 
       if (message.type === "result") {
         // An idle loop status that still lists active runs makes the SDK
@@ -968,13 +990,7 @@ export class LettaAcpAgent {
           continue;
         }
       }
-      const forwarded = await this.forwardMessage(
-        sessionId,
-        state,
-        message,
-        cx,
-      );
-      sawActivity = sawActivity || forwarded;
+      sawActivity = sawActivity || step.forwarded;
     }
     return { kind: "stream_end", activeRunIds, sawActivity };
   }
@@ -996,6 +1012,7 @@ export class LettaAcpAgent {
   shutdown(): void {
     for (const state of this.sessions.values()) {
       try {
+        state.reader?.stop();
         state.session.close();
       } catch {
         // best-effort cleanup on connection close
@@ -1391,23 +1408,6 @@ function sessionTitle(conversation: LettaConversation): string | undefined {
   const title = source.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
   if (!title) return undefined;
   return title.length <= 256 ? title : `${title.slice(0, 255)}…`;
-}
-
-/** Awaits `pending`, or resolves null when the deadline expires first. */
-async function raceDeadline<T>(
-  pending: Promise<T>,
-  timeoutMs: number,
-): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs);
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([pending, deadline]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }
 
 /**

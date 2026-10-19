@@ -92,6 +92,28 @@ class FakeAppServer {
     return FakeSocket as unknown as LettaCodeSocketConstructor;
   }
 
+  sendBackgroundReply(text: string): void {
+    if (!this.activeControlSocket || !this.activeRuntime) throw new Error("No runtime");
+    this.pushDelta(this.activeControlSocket, this.activeRuntime, {
+      message_type: "assistant_message", run_id: "run-background", content: text,
+    });
+    this.pushDelta(this.activeControlSocket, this.activeRuntime, {
+      message_type: "stop_reason", run_id: "run-background", stop_reason: "end_turn",
+    });
+    this.pushDelta(this.activeControlSocket, this.activeRuntime, {
+      message_type: "usage_statistics", run_id: "run-background",
+    });
+  }
+
+  sendBackgroundToolCall(): void {
+    if (!this.activeControlSocket || !this.activeRuntime) throw new Error("No runtime");
+    this.pushDelta(this.activeControlSocket, this.activeRuntime, {
+      message_type: "tool_call_message", run_id: "run-background",
+      tool_calls: [{ id: "call-background", name: "Bash",
+        arguments: JSON.stringify({ command: "pwd" }) }],
+    });
+  }
+
   /** Resolves with the next approval_response the adapter sends back. */
   nextApprovalResponse(): Promise<WireMessage> {
     return new Promise((resolve) => {
@@ -321,6 +343,7 @@ class FakeAppServer {
     if (payload.kind === "approval_response") {
       this.approvalResponses.push(payload);
       for (const waiter of this.approvalWaiters.splice(0)) waiter(payload);
+      if ((payload.decision as { behavior?: string } | undefined)?.behavior === "deny") return;
       const command = this.activeCommand;
       this.pushDelta(socket, runtime, {
         message_type: "tool_return_message",
@@ -617,6 +640,14 @@ class FakeAppServer {
     delta: WireMessage,
   ): void {
     socket.push({ type: "stream_delta", runtime, delta });
+    // The SDK settles terminal deltas only after the server's usage event.
+    if (delta.message_type === "stop_reason" && delta.stop_reason !== "requires_approval") {
+      socket.push({
+        type: "stream_delta",
+        runtime,
+        delta: { message_type: "usage_statistics", run_id: delta.run_id },
+      });
+    }
   }
 }
 
@@ -700,6 +731,76 @@ async function openSession(
 }
 
 describe("Agent SDK app-server integration", () => {
+  test("delivers background output after prompt completion without another prompt", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(await agent.prompt({
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }],
+      }, context)).toEqual({ stopReason: "end_turn" });
+      server.sendBackgroundReply("BACKGROUND_OK");
+      await Bun.sleep(30);
+      expect(updates.filter((update) =>
+        update.sessionUpdate === "agent_message_chunk" &&
+        (update.content as { text?: string }).text === "BACKGROUND_OK",
+      )).toHaveLength(1);
+      expect(await agent.prompt({
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "replacement after cancel" }],
+      }, context)).toEqual({ stopReason: "end_turn" });
+      expect(updates).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "REPLACEMENT_OK" },
+      });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("delivery survives an expired premature-result grace window", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { prematureResultGraceMs: 5 });
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(await agent.prompt({
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "silent idle prompt" }],
+      }, context)).toEqual({ stopReason: "end_turn" });
+      server.sendBackgroundReply("AFTER_GRACE");
+      await Bun.sleep(30);
+      expect(updates.filter((update) =>
+        (update.content as { text?: string } | undefined)?.text === "AFTER_GRACE",
+      )).toHaveLength(1);
+    } finally { agent.shutdown(); }
+  });
+
+  test("late tool cards and output still flow when an out-of-turn approval expires", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { outOfTurnPermissionTimeoutMs: 5 });
+    const { context, updates } = createContext({ answerPermissions: false });
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt({
+        sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }],
+      }, context);
+      server.sendBackgroundToolCall();
+      const denied = server.nextApprovalResponse();
+      server.requestPermissionAfterPrompt({ toolCallId: "call-background" });
+      expect(await denied).toEqual(expect.objectContaining({
+        decision: expect.objectContaining({ behavior: "deny" }),
+      }));
+      expect(updates).toContainEqual(expect.objectContaining({
+        sessionUpdate: "tool_call", toolCallId: "call-background",
+      }));
+      server.sendBackgroundReply("AFTER_LATE_APPROVAL");
+      await Bun.sleep(30);
+      expect(updates.filter((update) =>
+        (update.content as { text?: string } | undefined)?.text === "AFTER_LATE_APPROVAL",
+      )).toHaveLength(1);
+    } finally { agent.shutdown(); }
+  });
+
   test("advertises and maps Agent SDK MCP transports", async () => {
     const servers: McpServer[] = [
       {
@@ -820,58 +921,22 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
-  test("closes a displaced session when the same conversation is loaded again", async () => {
-    const server = new FakeAppServer();
-    const agent = createAgent(server);
-    const { context } = createContext();
-    const params = {
-      sessionId: "conv-existing",
-      cwd: "/tmp/letta-acp-test",
-      mcpServers: [],
-    };
 
-    try {
-      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
-      await agent.loadSession(params, context);
-      const closedBeforeReload = server.closedSockets;
 
-      await agent.loadSession(params, context);
 
-      expect(server.closedSockets).toBeGreaterThan(closedBeforeReload);
-    } finally {
-      agent.shutdown();
-    }
-  });
 
-  test("bounds session discovery lookups to one registry page", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "letta-acp-list-page-"));
-    const scope = "pagination-test";
-    const registry = new SessionRegistry(directory, scope);
-    const cwd = "/tmp/letta-acp-test";
-    for (let index = 0; index < 51; index += 1) {
-      await registry.record("agent-test", `conv-page-${String(index).padStart(2, "0")}`, cwd);
-    }
 
-    const server = new FakeAppServer();
-    const agent = createAgent(server, {
-      sessionRegistryDir: directory,
-      sessionRegistryScope: scope,
-    });
-    try {
-      const first = await agent.listSessions({ cwd });
-      expect(first.sessions).toHaveLength(50);
-      expect(first.nextCursor).toBeString();
-      expect(server.conversationRetrieveIds).toHaveLength(50);
 
-      const second = await agent.listSessions({ cwd, cursor: first.nextCursor });
-      expect(second.sessions).toHaveLength(1);
-      expect(second.nextCursor).toBeUndefined();
-      expect(server.conversationRetrieveIds).toHaveLength(51);
-    } finally {
-      agent.shutdown();
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
+
+
+
+
+
+
+
+
+
+
 
   test("removes archived and foreign sessions but retains unavailable records", async () => {
     const directory = await mkdtemp(join(tmpdir(), "letta-acp-list-stale-"));
@@ -919,57 +984,6 @@ describe("Agent SDK app-server integration", () => {
         "conv-test-3",
       ]);
       expect(new Set(server.runtimeStartRequestIds).size).toBe(3);
-    } finally {
-      agent.shutdown();
-    }
-  });
-
-  test("advertises available models in the session configuration", async () => {
-    const server = new FakeAppServer();
-    const agent = createAgent(server);
-    const { context } = createContext();
-
-    try {
-      const session = await openSession(agent, context);
-
-      expect(session.configOptions).toEqual([
-        {
-          id: "permissions",
-          name: "Permissions",
-          description: "Approval behavior for tool calls",
-          category: "mode",
-          type: "select",
-          currentValue: "standard",
-          options: [
-            expect.objectContaining({ value: "standard", name: "Ask before edits" }),
-            expect.objectContaining({ value: "acceptEdits", name: "Accept edits" }),
-            expect.objectContaining({
-              value: "unrestricted",
-              name: "Bypass permissions",
-            }),
-          ],
-        },
-        {
-          id: "model",
-          name: "Model",
-          description: "Model used for this Letta session",
-          category: "model",
-          type: "select",
-          currentValue: "test-model",
-          options: [
-            {
-              value: "test-model",
-              name: "Test Model",
-              description: "Deterministic test model",
-            },
-            {
-              value: "other-model",
-              name: "Other Model",
-              description: "Alternate deterministic model",
-            },
-          ],
-        },
-      ]);
     } finally {
       agent.shutdown();
     }

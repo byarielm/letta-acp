@@ -21,7 +21,7 @@ afterEach(() => {
   }
 });
 
-function startFakeAppServer() {
+function startFakeAppServer(onReply?: (emitLate: () => void) => void) {
   const server = Bun.serve<{ channel: "control" | "stream" }>({
     hostname: "127.0.0.1",
     port: 0,
@@ -70,6 +70,17 @@ function startFakeAppServer() {
               has_more: false,
             }));
             return;
+          case "list_connect_providers":
+            socket.send(JSON.stringify({
+              type: "list_connect_providers_response",
+              request_id: requiredString(message.request_id),
+              success: true,
+              providers: [{
+                provider_names: ["test"],
+                connected: { is_connected: true, provider_name: "test" },
+              }],
+            }));
+            return;
           case "list_models":
             socket.send(JSON.stringify({
               type: "list_models_response",
@@ -113,6 +124,19 @@ function startFakeAppServer() {
               message_type: "stop_reason",
               run_id: "run-acpx",
               stop_reason: "end_turn",
+            });
+            sendDelta(socket, {
+              message_type: "usage_statistics",
+              run_id: "run-acpx",
+            });
+            onReply?.(() => {
+              sendDelta(socket, {
+                message_type: "assistant_message", run_id: "run-late", content: "LATE_STDIO_OK",
+              });
+              sendDelta(socket, {
+                message_type: "stop_reason", run_id: "run-late", stop_reason: "end_turn",
+              });
+              sendDelta(socket, { message_type: "usage_statistics", run_id: "run-late" });
             });
             return;
           }
@@ -311,6 +335,80 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
 }
 
 describe("acpx client compatibility", () => {
+  test("stdio delivers a background response after the prompt result without new input", async () => {
+    let emitLate: (() => void) | undefined;
+    const url = startFakeAppServer((emit) => { emitLate = emit; });
+    const home = mkdtempSync(join(tmpdir(), "letta-acp-late-"));
+    tempDirs.push(home);
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "index.ts")], {
+      env: { ...process.env, HOME: home, LETTA_ACP_BACKEND: "remote",
+        LETTA_APP_SERVER_URL: url, LETTA_AGENT_ID: TEST_RUNTIME.agent_id },
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    const stderr = new Response(child.stderr).text();
+    const send = (id: number, method: string, params: unknown) => {
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      child.stdin.flush();
+    };
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill(); }, 4_000);
+    let promptCompleted = false;
+    let lateDelivered = false;
+    let replacementCompleted = false;
+    let replies = 0;
+    let sessionId = "";
+    let buffer = "";
+    const decoder = new TextDecoder();
+    try {
+      send(1, "initialize", { protocolVersion: 1, clientCapabilities: {} });
+      outer: for await (const chunk of child.stdout) {
+        buffer += decoder.decode(chunk, { stream: true });
+        let newline: number;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          if (!line.trim()) continue;
+          const message = JSON.parse(line);
+          if (message.error) throw new Error(JSON.stringify(message.error));
+          if (message.params?.update?.content?.text === "ACPX_OK") replies += 1;
+          if (message.id === 1) send(2, "session/new", { cwd: home, mcpServers: [] });
+          if (message.id === 2) {
+            sessionId = message.result.sessionId;
+            send(3, "session/prompt", { sessionId, prompt: [{ type: "text", text: "first" }] });
+          }
+          if (message.id === 3) {
+            expect(message.result.stopReason).toBe("end_turn");
+            promptCompleted = true;
+            expect(emitLate).toBeDefined();
+            emitLate!();
+          }
+          if (message.method === "session/update" &&
+              message.params.update.content?.text === "LATE_STDIO_OK") {
+            expect(promptCompleted).toBe(true);
+            expect(lateDelivered).toBe(false);
+            lateDelivered = true;
+            send(4, "session/prompt", { sessionId, prompt: [{ type: "text", text: "second" }] });
+          }
+          if (message.id === 4) {
+            expect(message.result.stopReason).toBe("end_turn");
+            expect(replies).toBe(2);
+            replacementCompleted = true;
+            break outer;
+          }
+        }
+      }
+      expect(timedOut).toBe(false);
+      expect(lateDelivered).toBe(true);
+      expect(replacementCompleted).toBe(true);
+    } finally {
+      clearTimeout(timer);
+      child.stdin.end();
+      if (child.exitCode === null) child.kill();
+      await child.exited;
+      await stderr;
+    }
+  }, 6_000);
+
   test("completes a prompt through a real ACP client", async () => {
     const { stdout } = await runAcpx("quiet");
     expect(stdout.trim()).toBe("ACPX_OK");
