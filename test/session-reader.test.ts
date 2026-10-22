@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { LettaCodeSession, SDKMessage } from "@letta-ai/letta-agent-sdk";
 import { PromptEvents, SessionReader } from "../src/session-reader.js";
 
-const reply = (text: string): SDKMessage => ({
+const reply = (text: string): Extract<SDKMessage, { type: "assistant" }> => ({
   type: "assistant", content: text, uuid: text,
 });
 
@@ -97,6 +97,50 @@ test("a new observer does not inherit a notification already being delivered", a
     expect(await observer.next(5)).toBeUndefined();
     f.reader.release(observer);
   } finally { finish(); await f.close(); }
+});
+
+test("late results from a prior run cannot complete a replacement observer", async () => {
+  const delivered: SDKMessage[] = [];
+  const f = fixture(async (message) => { delivered.push(message); return true; });
+  try {
+    const first = f.reader.observe();
+    f.push({ ...reply("old"), runId: "run-old" });
+    await first.next();
+    f.reader.release(first);
+    const replacement = f.reader.observe();
+    f.push({ ...reply("old continuation"), runId: "run-old" });
+    expect(await replacement.next()).toMatchObject({ stale: true, forwarded: false });
+    expect(replacement.hasActivity).toBe(false);
+    const result: SDKMessage = {
+      type: "result", success: true, stopReason: "end_turn", durationMs: 0,
+      conversationId: "conv-test", runIds: ["run-old"],
+    };
+    f.push(result);
+    expect(await replacement.next()).toMatchObject({
+      message: result, stale: true, forwarded: false,
+    });
+    expect(replacement.hasActivity).toBe(false);
+    f.push({ ...reply("new"), runId: "run-new" });
+    expect(await replacement.next()).toMatchObject({ stale: false, forwarded: true });
+    expect(replacement.hasActivity).toBe(true);
+    expect(delivered).toContain(result);
+    f.reader.release(replacement);
+  } finally { await f.close(); }
+});
+
+test("activity belongs to consumed events, not later events already queued", async () => {
+  const events = new PromptEvents();
+  const result: SDKMessage = {
+    type: "result", success: true, durationMs: 0, conversationId: "conv-test",
+  };
+  events.push({ message: result, forwarded: false });
+  events.push({ message: reply("later"), forwarded: true });
+  expect(events.hasActivity).toBe(false);
+  expect((await events.next())?.message).toBe(result);
+  expect(events.hasActivity).toBe(false);
+  await events.next();
+  expect(events.hasActivity).toBe(true);
+  events.close();
 });
 
 test("delivery failure settles an active observer and remains visible to later observers", async () => {

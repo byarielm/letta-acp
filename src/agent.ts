@@ -145,9 +145,8 @@ const MODEL_CATALOG_TTL_MS = 30_000;
 const DEFAULT_OUT_OF_TURN_PERMISSION_TIMEOUT_MS = 300_000;
 
 /**
- * How long to keep a turn open after the server reported completion while
- * still listing active runs. Long enough to cover the next model step, short
- * enough that a server which never speaks again cannot wedge the prompt.
+ * Wait for continuation after an unconfirmed completion, including synthetic
+ * results without turn activity. Metadata chatter must not extend this bound.
  */
 const DEFAULT_PREMATURE_RESULT_GRACE_MS = 30_000;
 
@@ -156,7 +155,7 @@ const EXECUTE_COMMAND_MAX_ROUNDS = 50;
 
 type PumpOutcome =
   | { kind: "result"; result: SDKResultMessage }
-  /** Turn reported complete while the server still listed active runs. */
+  /** A prior-run or synthetic result cannot confirm this prompt's completion. */
   | { kind: "premature"; result: SDKResultMessage }
   | { kind: "idle" }
   /** Stream ended; carries what the round last saw for active runs. */
@@ -851,6 +850,7 @@ export class LettaAcpAgent {
       let mode: "turn" | "recovery" = "turn";
       let graceMs: number | undefined;
       let pendingRunIds: readonly string[] = [];
+      let unconfirmedDeadline: number | undefined;
       let round = 0;
       while (true) {
         round += 1;
@@ -871,6 +871,7 @@ export class LettaAcpAgent {
           mode,
           graceMs: graceMs ?? null,
           outcome: outcome.kind,
+          sawActivity: events.hasActivity,
           ...(outcome.kind === "premature" || outcome.kind === "result"
             ? {
                 success: outcome.result.success,
@@ -895,9 +896,14 @@ export class LettaAcpAgent {
             // server really was done.
             pendingRunIds = outcome.result.runIds ?? [];
             const runIds = pendingRunIds.join(", ") || "unknown";
-            log(`turn reported complete while runs are active (${runIds})`);
+            log(`turn completion is unconfirmed (runs: ${runIds}); waiting for continuation`);
             mode = "recovery";
-            graceMs = this.prematureResultGraceMs;
+            if (!events.hasActivity) {
+              unconfirmedDeadline ??= performance.now() + this.prematureResultGraceMs;
+              graceMs = Math.max(0, unconfirmedDeadline - performance.now());
+            } else {
+              graceMs = this.prematureResultGraceMs;
+            }
             continue;
           }
           case "result": {
@@ -910,10 +916,16 @@ export class LettaAcpAgent {
             return this.toPromptResponse(state, result);
           }
           case "idle":
+            if (!events.hasActivity) {
+              throw new Error("Letta reported idle without confirming completion of this prompt; no turn activity followed");
+            }
             // Release the prompt after the grace window; the session reader
             // still delivers later work without another user message.
             return { stopReason: "end_turn" };
           case "stream_end": {
+            if (!events.hasActivity) {
+              throw new Error("Letta stream ended without confirming completion of this prompt");
+            }
             // Preserve the existing grace policy for a stream ending while the
             // server still lists active runs. Delivery no longer depends on it.
             // When enabled, stay with the run; the round's first-message deadline
@@ -1106,6 +1118,7 @@ export class LettaAcpAgent {
     firstMessageDeadlineMs?: number,
   ): Promise<PumpOutcome> {
     let sawActivity = false;
+    let sawProtocolActivity = false;
     let idleStatusCount = 0;
     let activeRunIds: readonly string[] = [];
     const startedAt = performance.now();
@@ -1117,11 +1130,17 @@ export class LettaAcpAgent {
       deadlineMs: firstMessageDeadlineMs ?? null,
     });
 
-    let awaitingFirstMessage = true;
+    let awaitingActivity = true;
+    const deadline = firstMessageDeadlineMs === undefined
+      ? undefined : startedAt + firstMessageDeadlineMs;
     while (true) {
+      if (awaitingActivity && deadline !== undefined && performance.now() >= deadline) {
+        return { kind: "idle" };
+      }
       // Expiring this observation must not leave a pending SDK read behind.
       const step = await state.promptEvents!.next(
-        awaitingFirstMessage ? firstMessageDeadlineMs : undefined,
+        awaitingActivity && deadline !== undefined
+          ? Math.max(0, deadline - performance.now()) : undefined,
       );
       if (!step) {
         debug({
@@ -1132,25 +1151,34 @@ export class LettaAcpAgent {
           sawActivity,
           activeRunIds,
         });
-        log("no further activity during the grace round; ending turn");
+        log("no turn activity before the recovery deadline");
         return { kind: "idle" };
       }
-      awaitingFirstMessage = false;
       if (!step.message) {
         if (step.error) throw step.error;
         break;
       }
       const message = step.message;
+      if (step.stale) {
+        if (message.type === "result") {
+          debug({ ev: "ignored_prior_result", sessionId, runIds: message.runIds ?? [] });
+          return { kind: "premature", result: message };
+        }
+        continue;
+      }
+      if (step.forwarded) awaitingActivity = false;
+      if (message.type !== "init" && message.type !== "queue_update" && message.type !== "loop_status") {
+        sawProtocolActivity = true;
+      }
 
       if (message.type === "result") {
-        // An idle loop status that still lists active runs makes the SDK
-        // synthesize a successful, stop-reason-less turn result. Taking it at
-        // face value ends the prompt mid-run, stranding the tool calls that
-        // are still streaming and pushing their approvals outside the turn.
+        // The SDK can synthesize success from user/metadata deltas plus idle,
+        // with neither a terminal reason nor model activity. It can also do so
+        // while runs remain active. Neither proves this prompt finished.
         if (
           message.success &&
           message.stopReason == null &&
-          activeRunIds.length > 0
+          (activeRunIds.length > 0 || !state.promptEvents!.hasActivity)
         ) {
           return { kind: "premature", result: message };
         }
@@ -1158,21 +1186,19 @@ export class LettaAcpAgent {
       }
       if (message.type === "loop_status") {
         activeRunIds = message.activeRunIds;
-        // An abort after real turn activity makes the SDK enqueue this idle
-        // status followed by the cancelled turn's synthesized result. Drain
-        // that result before returning so the next prompt cannot consume it
-        // as its own terminal event. An abort before any activity has no
-        // result, so the idle status remains its only completion signal.
+        // Metadata is also SDK turn evidence: drain its interrupted result,
+        // even when nothing was rendered. In recovery the SDK already consumed
+        // its tracker, so idle has no second result to wait for.
         if (message.status === "WAITING_ON_INPUT" && state.cancelled) {
-          if (sawActivity) continue;
+          if (mode === "turn" && sawProtocolActivity) continue;
           return { kind: "idle" };
         }
         if (mode === "recovery") {
           if (message.status === "WAITING_ON_INPUT") {
             idleStatusCount += 1;
-            // The first idle status can be stale (queued before the resume);
-            // trust it once we've seen real activity or it repeats.
-            if (sawActivity || idleStatusCount >= 2) {
+            // The first idle status can be queued before the resume; repetitions
+            // are useful only after this prompt did real work.
+            if (sawActivity || (idleStatusCount >= 2 && state.promptEvents!.hasActivity)) {
               return { kind: "idle" };
             }
           }

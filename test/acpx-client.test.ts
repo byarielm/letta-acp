@@ -21,7 +21,11 @@ afterEach(() => {
   }
 });
 
-function startFakeAppServer(onReply?: (emitLate: () => void) => void) {
+function startFakeAppServer(
+  onReply?: (emitLate: () => void) => void,
+  unconfirmedFirst = false,
+) {
+  let replyCount = 0;
   const server = Bun.serve<{ channel: "control" | "stream" }>({
     hostname: "127.0.0.1",
     port: 0,
@@ -99,45 +103,59 @@ function startFakeAppServer(onReply?: (emitLate: () => void) => void) {
           case "input": {
             const payload = message.payload as WireMessage;
             if (payload.kind !== "create_message") return;
-            sendDelta(socket, {
-              message_type: "tool_call_message",
-              run_id: "run-acpx",
-              tool_calls: [{
-                id: "call-acpx",
-                name: "Read",
-                arguments: JSON.stringify({ file_path: "/tmp/example.txt" }),
-              }],
-            });
-            sendDelta(socket, {
-              message_type: "tool_return_message",
-              run_id: "run-acpx",
-              tool_call_id: "call-acpx",
-              tool_return: "example contents",
-              status: "success",
-            });
-            sendDelta(socket, {
-              message_type: "assistant_message",
-              run_id: "run-acpx",
-              content: "ACPX_OK",
-            });
-            sendDelta(socket, {
-              message_type: "stop_reason",
-              run_id: "run-acpx",
-              stop_reason: "end_turn",
-            });
-            sendDelta(socket, {
-              message_type: "usage_statistics",
-              run_id: "run-acpx",
-            });
-            onReply?.(() => {
+            const reply = () => {
+              const runId = `run-acpx-${++replyCount}`;
               sendDelta(socket, {
-                message_type: "assistant_message", run_id: "run-late", content: "LATE_STDIO_OK",
+                message_type: "tool_call_message",
+                run_id: runId,
+                tool_calls: [{
+                  id: "call-acpx",
+                  name: "Read",
+                  arguments: JSON.stringify({ file_path: "/tmp/example.txt" }),
+                }],
               });
               sendDelta(socket, {
-                message_type: "stop_reason", run_id: "run-late", stop_reason: "end_turn",
+                message_type: "tool_return_message",
+                run_id: runId,
+                tool_call_id: "call-acpx",
+                tool_return: "example contents",
+                status: "success",
               });
-              sendDelta(socket, { message_type: "usage_statistics", run_id: "run-late" });
-            });
+              sendDelta(socket, {
+                message_type: "assistant_message",
+                run_id: runId,
+                content: "ACPX_OK",
+              });
+              sendDelta(socket, {
+                message_type: "stop_reason",
+                run_id: runId,
+                stop_reason: "end_turn",
+              });
+              sendDelta(socket, { message_type: "usage_statistics", run_id: runId });
+              onReply?.(() => {
+                sendDelta(socket, {
+                  message_type: "assistant_message", run_id: "run-late", content: "LATE_STDIO_OK",
+                });
+                sendDelta(socket, {
+                  message_type: "stop_reason", run_id: "run-late", stop_reason: "end_turn",
+                });
+                sendDelta(socket, { message_type: "usage_statistics", run_id: "run-late" });
+              });
+              socket.send(JSON.stringify({
+                type: "update_loop_status", runtime: TEST_RUNTIME,
+                loop_status: { status: "WAITING_ON_INPUT", active_run_ids: [] },
+              }));
+            };
+            if (unconfirmedFirst) {
+              sendDelta(socket, { message_type: "user_message", content: "queued input" });
+              socket.send(JSON.stringify({
+                type: "update_loop_status", runtime: TEST_RUNTIME,
+                loop_status: { status: "WAITING_ON_INPUT", active_run_ids: [] },
+              }));
+              setTimeout(reply, 25);
+            } else {
+              reply();
+            }
             return;
           }
         }
@@ -183,10 +201,11 @@ async function runAcpx(
   format: "json" | "quiet",
   command: string[] = ["exec", "Exercise the ACP tool lifecycle."],
   seedSession = false,
+  unconfirmedFirst = false,
 ) {
   const home = mkdtempSync(join(tmpdir(), "letta-acp-acpx-"));
   tempDirs.push(home);
-  const appServerUrl = startFakeAppServer();
+  const appServerUrl = startFakeAppServer(undefined, unconfirmedFirst);
   const cwd = join(import.meta.dir, "..");
   if (seedSession) {
     const registry = new SessionRegistry(
@@ -417,6 +436,11 @@ describe("acpx client compatibility", () => {
 
   test("completes a prompt through a real ACP client", async () => {
     const { stdout } = await runAcpx("quiet");
+    expect(stdout.trim()).toBe("ACPX_OK");
+  }, 10_000);
+
+  test("a real ACP client waits past an unconfirmed synthetic completion", async () => {
+    const { stdout } = await runAcpx("quiet", undefined, false, true);
     expect(stdout.trim()).toBe("ACPX_OK");
   }, 10_000);
 

@@ -24,8 +24,8 @@ export interface LettaAcpConfig {
    */
   outOfTurnPermissionTimeoutMs?: number;
   /**
-   * How long a turn stays open after the server reports completion while still
-   * listing active runs. Defaults to 30 seconds.
+   * How long to wait for activity after an unconfirmed or prior-run completion.
+   * Defaults to 30 seconds; no activity produces an error, not empty success.
    */
   prematureResultGraceMs?: number;
   /**

@@ -55,6 +55,9 @@ class FakeAppServer {
   private commandWaiters: Array<() => void> = [];
   private cancelablePromptWaiters: Array<() => void> = [];
   private cancelablePromptActive = false;
+  private unconfirmedContinuation: ((finish: boolean) => void) | undefined;
+  private unconfirmedWaiters: Array<() => void> = [];
+  private promptCount = 0;
 
   socketConstructor(): LettaCodeSocketConstructor {
     const server = this;
@@ -157,6 +160,28 @@ class FakeAppServer {
   nextCancelablePrompt(): Promise<void> {
     return new Promise((resolve) => {
       this.cancelablePromptWaiters.push(resolve);
+    });
+  }
+
+  nextUnconfirmedCompletion(): Promise<void> {
+    return new Promise((resolve) => this.unconfirmedWaiters.push(resolve));
+  }
+
+  continueUnconfirmedPrompt(finish = true): void {
+    const continuation = this.unconfirmedContinuation;
+    this.unconfirmedContinuation = undefined;
+    if (!continuation) throw new Error("No unconfirmed prompt");
+    continuation(finish);
+  }
+
+  sendIdleMetadata(): void {
+    if (!this.activeControlSocket || !this.activeRuntime) throw new Error("No runtime");
+    this.pushDelta(this.activeControlSocket, this.activeRuntime, {
+      message_type: "user_message", content: "metadata only",
+    });
+    this.activeControlSocket.push({
+      type: "update_loop_status", runtime: this.activeRuntime,
+      loop_status: { status: "WAITING_ON_INPUT", active_run_ids: [] },
     });
   }
 
@@ -427,6 +452,58 @@ class FakeAppServer {
     }
 
     const promptText = JSON.stringify(payload.messages);
+    const promptNumber = ++this.promptCount;
+    if (promptText.includes("unconfirmed prompt")) {
+      this.cancelablePromptActive = true;
+      // A user/metadata delta is SDK turn evidence, but not model activity.
+      // The following idle status synthesizes success with no reason or runs.
+      if (promptText.includes("late prior terminal")) {
+        this.pushDelta(socket, runtime, {
+          message_type: "stop_reason", run_id: "run-cancelled",
+          stop_reason: promptText.includes("failed") ? "llm_api_error" : "end_turn",
+        });
+      } else {
+        this.pushDelta(socket, runtime, {
+          message_type: "user_message", content: "queued input",
+        });
+      }
+      const idle = () => socket.push({
+        type: "update_loop_status", runtime,
+        loop_status: { status: "WAITING_ON_INPUT", active_run_ids: [] },
+      });
+      idle();
+      if (promptText.includes("duplicate idle")) {
+        idle();
+        idle();
+      }
+      this.unconfirmedContinuation = (finish) => {
+        this.pushDelta(socket, runtime, {
+          message_type: "assistant_message", run_id: `run-continuation-${promptNumber}`,
+          content: "CONTINUATION_OK",
+        });
+        if (finish) {
+          this.cancelablePromptActive = false;
+          idle();
+        }
+      };
+      for (const waiter of this.unconfirmedWaiters.splice(0)) waiter();
+      return;
+    }
+    if (promptText.includes("explicit empty prompt")) {
+      this.pushDelta(socket, runtime, {
+        message_type: "stop_reason", run_id: `run-empty-${promptNumber}`,
+        stop_reason: "end_turn",
+      });
+      return;
+    }
+    if (promptText.includes("cancel metadata prompt")) {
+      this.cancelablePromptActive = true;
+      for (const waiter of this.cancelablePromptWaiters.splice(0)) waiter();
+      this.pushDelta(socket, runtime, {
+        message_type: "user_message", content: "queued input",
+      });
+      return;
+    }
     if (promptText.includes("cancel active prompt")) {
       this.cancelablePromptActive = true;
       for (const waiter of this.cancelablePromptWaiters.splice(0)) waiter();
@@ -541,12 +618,12 @@ class FakeAppServer {
 
     this.pushDelta(socket, runtime, {
       message_type: "assistant_message",
-      run_id: "run-prompt",
+      run_id: promptNumber === 1 ? "run-prompt" : `run-prompt-${promptNumber}`,
       content: "PROMPT_OK",
     });
     this.pushDelta(socket, runtime, {
       message_type: "stop_reason",
-      run_id: "run-prompt",
+      run_id: promptNumber === 1 ? "run-prompt" : `run-prompt-${promptNumber}`,
       stop_reason: "end_turn",
     });
   }
@@ -2326,6 +2403,107 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
+  test.each([
+    "standalone", "after cancel", "after cancel with duplicate idle",
+    "after cancel with late prior terminal", "after cancel with failed late prior terminal",
+  ])(
+    "waits for current activity after an unowned completion: %s",
+    async (scenario) => {
+      const server = new FakeAppServer();
+      const agent = createAgent(server);
+      const { context, updates } = createContext();
+      try {
+        const session = await openSession(agent, context);
+        if (scenario.startsWith("after cancel")) {
+          const started = server.nextCancelablePrompt();
+          const first = agent.prompt({
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text: "cancel active prompt" }],
+          }, context);
+          await started;
+          await agent.cancel({ sessionId: session.sessionId });
+          expect(await first).toEqual({ stopReason: "cancelled" });
+        }
+        const updateStart = updates.length;
+        const synthetic = server.nextUnconfirmedCompletion();
+        let settled = false;
+        const pending = agent.prompt({
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: `unconfirmed prompt ${scenario}` }],
+        }, context).finally(() => { settled = true; });
+        await synthetic;
+        await Bun.sleep(10);
+        expect(settled).toBe(false);
+        server.continueUnconfirmedPrompt();
+        expect(await pending).toEqual({ stopReason: "end_turn" });
+        expect(updates.slice(updateStart).filter((u) =>
+          u.sessionUpdate !== "available_commands_update",
+        )).toEqual([{
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "CONTINUATION_OK" },
+        }]);
+      } finally {
+        agent.shutdown();
+      }
+    },
+  );
+
+  test("reports an unconfirmed completion instead of silently succeeding", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { prematureResultGraceMs: 20 });
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      await expect(agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "unconfirmed prompt duplicate idle" }],
+      }, context)).rejects.toThrow("without confirming completion");
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("metadata chatter cannot keep an unconfirmed prompt open indefinitely", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { prematureResultGraceMs: 20 });
+    const { context } = createContext();
+    let chatter: ReturnType<typeof setInterval> | undefined;
+    try {
+      const session = await openSession(agent, context);
+      const started = server.nextUnconfirmedCompletion();
+      const pending = agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "unconfirmed prompt" }],
+      }, context);
+      const rejection = expect(pending).rejects.toThrow("without confirming completion");
+      await started;
+      chatter = setInterval(() => server.sendIdleMetadata(), 2);
+      await rejection;
+    } finally {
+      clearInterval(chatter);
+      agent.shutdown();
+    }
+  });
+
+  test("accepts an explicit terminal result with no visible output", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const updateStart = updates.length;
+      expect(await agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "explicit empty prompt" }],
+      }, context)).toEqual({ stopReason: "end_turn" });
+      expect(updates.slice(updateStart).filter((u) =>
+        u.sessionUpdate !== "available_commands_update",
+      )).toEqual([]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
   test("keeps the turn open when the server is still running a job", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server);
@@ -2460,36 +2638,29 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
-  test("drains a cancelled turn before starting its replacement", async () => {
+  test("cancels continuation recovery without waiting for a nonexistent second result", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server);
     const { context, updates } = createContext();
-
     try {
       const session = await openSession(agent, context);
-      const started = server.nextCancelablePrompt();
-      const first = agent.prompt(
-        {
-          sessionId: session.sessionId,
-          prompt: [{ type: "text", text: "cancel active prompt" }],
-        },
-        context,
-      );
+      const started = server.nextUnconfirmedCompletion();
+      const first = agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "unconfirmed prompt" }],
+      }, context);
       await started;
+      await Bun.sleep(5);
+      server.continueUnconfirmedPrompt(false);
+      await Bun.sleep(5);
       await agent.cancel({ sessionId: session.sessionId });
       expect(await first).toEqual({ stopReason: "cancelled" });
-
-      const replacementUpdateStart = updates.length;
-      const replacement = await agent.prompt(
-        {
-          sessionId: session.sessionId,
-          prompt: [{ type: "text", text: "replacement after cancel" }],
-        },
-        context,
-      );
-
-      expect(replacement).toEqual({ stopReason: "end_turn" });
-      expect(updates.slice(replacementUpdateStart)).toContainEqual({
+      const updateStart = updates.length;
+      expect(await agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "replacement after cancel" }],
+      }, context)).toEqual({ stopReason: "end_turn" });
+      expect(updates.slice(updateStart)).toContainEqual({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: "REPLACEMENT_OK" },
       });
@@ -2497,6 +2668,47 @@ describe("Agent SDK app-server integration", () => {
       agent.shutdown();
     }
   });
+
+  test.each(["cancel active prompt", "cancel metadata prompt"])(
+    "drains a cancelled turn before starting its replacement: %s",
+    async (text) => {
+      const server = new FakeAppServer();
+      const agent = createAgent(server);
+      const { context, updates } = createContext();
+
+      try {
+        const session = await openSession(agent, context);
+        const started = server.nextCancelablePrompt();
+        const first = agent.prompt(
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text }],
+          },
+          context,
+        );
+        await started;
+        await agent.cancel({ sessionId: session.sessionId });
+        expect(await first).toEqual({ stopReason: "cancelled" });
+
+        const replacementUpdateStart = updates.length;
+        const replacement = await agent.prompt(
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text: "replacement after cancel" }],
+          },
+          context,
+        );
+
+        expect(replacement).toEqual({ stopReason: "end_turn" });
+        expect(updates.slice(replacementUpdateStart)).toContainEqual({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "REPLACEMENT_OK" },
+        });
+      } finally {
+        agent.shutdown();
+      }
+    },
+  );
 
   test("cancels an execute command before its first turn event", async () => {
     const server = new FakeAppServer();
