@@ -357,6 +357,7 @@ describe("acpx client compatibility", () => {
     let replacementCompleted = false;
     let replies = 0;
     let sessionId = "";
+    let commandsReceived = false;
     let buffer = "";
     const decoder = new TextDecoder();
     try {
@@ -370,6 +371,10 @@ describe("acpx client compatibility", () => {
           if (!line.trim()) continue;
           const message = JSON.parse(line);
           if (message.error) throw new Error(JSON.stringify(message.error));
+          if (message.params?.update?.sessionUpdate === "available_commands_update") {
+            expect(sessionId).not.toBe("");
+            commandsReceived = true;
+          }
           if (message.params?.update?.content?.text === "ACPX_OK") replies += 1;
           if (message.id === 1) send(2, "session/new", { cwd: home, mcpServers: [] });
           if (message.id === 2) {
@@ -392,6 +397,7 @@ describe("acpx client compatibility", () => {
           if (message.id === 4) {
             expect(message.result.stopReason).toBe("end_turn");
             expect(replies).toBe(2);
+            expect(commandsReceived).toBe(true);
             replacementCompleted = true;
             break outer;
           }

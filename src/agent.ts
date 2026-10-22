@@ -186,6 +186,7 @@ export class LettaAcpAgent {
   private readonly sessionRegistry: SessionRegistry;
   private readonly sessions = new Map<string, AcpSessionState>();
   private readonly sessionLoads = new Map<string, Promise<LoadSessionResponse>>();
+  private readonly commandAnnouncements = new Set<ReturnType<typeof setImmediate>>();
   private agentIdPromise: Promise<string> | null = null;
   private supportsTerminalOutput = false;
   private clientFsCaps: EditorFsCapabilities = {
@@ -255,10 +256,16 @@ export class LettaAcpAgent {
     });
     await this.rememberSession(agentId, sessionId, params.cwd);
     log(`session ${sessionId} -> agent ${agentId} (cwd: ${params.cwd})`);
-    this.announceCommands(sessionId, cx);
     const configOptions = await this.sessionConfigOptions(state);
     this.startReader(sessionId, state);
     log(`timing: new session ${Math.round(performance.now() - started)}ms`);
+    // The SDK queues the response in a promise continuation. Wait until the
+    // next event-loop turn so Zed registers the id before receiving commands.
+    const announcement = setImmediate(() => {
+      this.commandAnnouncements.delete(announcement);
+      if (this.sessions.has(sessionId)) this.announceCommands(sessionId, cx);
+    });
+    this.commandAnnouncements.add(announcement);
     return {
       sessionId,
       modes: sessionModeState(state.modeId),
@@ -807,7 +814,7 @@ export class LettaAcpAgent {
         sessionUpdate: "available_commands_update",
         availableCommands,
       },
-    });
+    }).catch((error) => log(`command announcement failed for ${sessionId}: ${String(error)}`));
   }
 
   async prompt(
@@ -1212,6 +1219,8 @@ export class LettaAcpAgent {
   }
 
   shutdown(): void {
+    for (const announcement of this.commandAnnouncements) clearImmediate(announcement);
+    this.commandAnnouncements.clear();
     for (const state of this.sessions.values()) {
       try {
         state.reader?.stop();
