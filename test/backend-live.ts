@@ -1,8 +1,8 @@
 import {
-  ClientSideConnection,
+  client,
+  methods,
   ndJsonStream,
   PROTOCOL_VERSION,
-  type Client,
   type SessionNotification,
 } from "@agentclientprotocol/sdk";
 import { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
@@ -136,23 +136,21 @@ async function exerciseBackend(
     },
   });
   const updates: SessionNotification[] = [];
-  const client: Client = {
-    requestPermission(params) {
+  const connection = await client({ name: "letta-acp-live-test" })
+    .onRequest(methods.client.session.requestPermission, ({ params }) => {
       const reject = params.options.find((option) => option.kind === "reject_once");
       return reject
         ? { outcome: { outcome: "selected", optionId: reject.optionId } }
         : { outcome: { outcome: "cancelled" } };
-    },
-    sessionUpdate(params) {
+    })
+    .onNotification(methods.client.session.update, ({ params }) => {
       updates.push(params);
-    },
-  };
-  const stream = ndJsonStream(output, child.stdout);
-  const connection = new ClientSideConnection(() => client, stream);
+    })
+    .connect(ndJsonStream(output, child.stdout));
 
   try {
     await withTimeout(
-      connection.initialize({
+      connection.agent.request(methods.agent.initialize, {
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: {},
         clientInfo: { name: "letta-acp-live-test", version: "1" },
@@ -162,7 +160,7 @@ async function exerciseBackend(
     );
 
     const session = await withTimeout(
-      connection.newSession({ cwd: root, mcpServers: [] }),
+      connection.agent.request(methods.agent.session.new, { cwd: root, mcpServers: [] }),
       120_000,
       `${selectedBackend} agent creation`,
     );
@@ -185,7 +183,7 @@ async function exerciseBackend(
 
     updates.length = 0;
     await withTimeout(
-      connection.prompt({
+      connection.agent.request(methods.agent.session.prompt, {
         sessionId,
         prompt: [{ type: "text", text: "/model" }],
       }),
@@ -201,7 +199,7 @@ async function exerciseBackend(
 
     updates.length = 0;
     await withTimeout(
-      connection.prompt({
+      connection.agent.request(methods.agent.session.prompt, {
         sessionId,
         prompt: [{
           type: "text",
