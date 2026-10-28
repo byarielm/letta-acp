@@ -1689,7 +1689,7 @@ export function toSdkMcpServers(
       ]);
       continue;
     }
-    log(`MCP server "${server.name}" skipped: ACP transport is not supported`);
+    log("MCP server skipped: ACP transport is not supported");
   }
   return Object.fromEntries(configs);
 }
