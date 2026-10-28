@@ -500,12 +500,14 @@ class FakeAppServer {
       });
       return;
     }
-    if (promptText.includes("cancel metadata prompt")) {
+    if (promptText.includes("cancel metadata prompt") || promptText.includes("cancel silent prompt")) {
       this.cancelablePromptActive = true;
       for (const waiter of this.cancelablePromptWaiters.splice(0)) waiter();
-      this.pushDelta(socket, runtime, {
-        message_type: "user_message", content: "queued input",
-      });
+      if (promptText.includes("cancel metadata prompt")) {
+        this.pushDelta(socket, runtime, {
+          message_type: "user_message", content: "queued input",
+        });
+      }
       return;
     }
     if (promptText.includes("cancel active prompt")) {
@@ -2697,7 +2699,7 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
-  test.each(["cancel active prompt", "cancel metadata prompt"])(
+  test.each(["cancel active prompt", "cancel metadata prompt", "cancel silent prompt"])(
     "drains a cancelled turn before starting its replacement: %s",
     async (text) => {
       const server = new FakeAppServer();

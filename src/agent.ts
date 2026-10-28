@@ -1118,7 +1118,6 @@ export class LettaAcpAgent {
     firstMessageDeadlineMs?: number,
   ): Promise<PumpOutcome> {
     let sawActivity = false;
-    let sawProtocolActivity = false;
     let idleStatusCount = 0;
     let activeRunIds: readonly string[] = [];
     const startedAt = performance.now();
@@ -1167,9 +1166,6 @@ export class LettaAcpAgent {
         continue;
       }
       if (step.forwarded) awaitingActivity = false;
-      if (message.type !== "init" && message.type !== "queue_update" && message.type !== "loop_status") {
-        sawProtocolActivity = true;
-      }
 
       if (message.type === "result") {
         // The SDK can synthesize success from user/metadata deltas plus idle,
@@ -1186,11 +1182,11 @@ export class LettaAcpAgent {
       }
       if (message.type === "loop_status") {
         activeRunIds = message.activeRunIds;
-        // Metadata is also SDK turn evidence: drain its interrupted result,
-        // even when nothing was rendered. In recovery the SDK already consumed
-        // its tracker, so idle has no second result to wait for.
+        // Drain the SDK's interrupted result even when cancellation preceded
+        // all turn evidence, or it can cancel the next prompt. In recovery the
+        // SDK already consumed its tracker, so no second result is expected.
         if (message.status === "WAITING_ON_INPUT" && state.cancelled) {
-          if (mode === "turn" && sawProtocolActivity) continue;
+          if (mode === "turn") continue;
           return { kind: "idle" };
         }
         if (mode === "recovery") {
