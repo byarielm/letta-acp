@@ -128,9 +128,14 @@ export function isUsableModel(
   return key === BUILTIN_NAMESPACE || connectedProviders.has(key);
 }
 
-/** Drop a trailing "(Provider)" that merely repeats the group heading. */
-function withoutProviderSuffix(label: string, providerName: string): string {
-  const stripped = label.replace(
+/** Drop runtime provider decorations already supplied by the group heading. */
+function withoutProviderSuffix(label: string, providerName: string, providerId: string): string {
+  const separator = label.lastIndexOf(" · ");
+  const undecorated = separator >= 0 &&
+    label.slice(separator + 3).trim().toLowerCase() === providerId.toLowerCase()
+    ? label.slice(0, separator).trim()
+    : label;
+  const stripped = undecorated.replace(
     /\s*\(([^)]*)\)\s*$/,
     (whole: string, inner: string) =>
       inner.trim().toLowerCase() === providerName.trim().toLowerCase()
@@ -157,7 +162,7 @@ export function groupedModelOptions(
     }
     group.options.push({
       value: variant.id,
-      name: withoutProviderSuffix(variant.label, group.name),
+      name: withoutProviderSuffix(variant.label, group.name, key),
       ...(variant.description ? { description: variant.description } : {}),
     });
   }

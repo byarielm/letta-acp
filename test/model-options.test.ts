@@ -78,4 +78,29 @@ describe("model option collapsing and grouping", () => {
       { group: "letta", name: "Letta", models: ["Auto"] },
     ]);
   });
+
+  test("removes runtime provider IDs before redundant parenthetical provider names", () => {
+    const entries = [
+      e("gpt-pro", "chatgpt-plus-pro/gpt-5.4-pro", "GPT-5.4 Pro (ChatGPT) · chatgpt-plus-pro"),
+      e("beam", "opencode-go/beam-free", "beam-free · opencode-go"),
+      e("deepseek", "opencode-go/deepseek-v4-pro", "deepseek-v4-pro · opencode-go"),
+    ];
+    const groups = groupedModelOptions(entries as any);
+    expect(groups.map((g) => g.options.map((o) => ({ value: o.value, name: o.name }))))
+      .toEqual([
+        [{ value: "gpt-pro", name: "GPT-5.4 Pro" }],
+        [{ value: "beam", name: "beam-free" }, { value: "deepseek", name: "deepseek-v4-pro" }],
+      ]);
+  });
+
+  test("preserves meaningful model suffixes and never produces an empty name", () => {
+    const entries = [
+      e("research", "google_ai/research", "Research (Apr-21-2026) · google_ai"),
+      e("fast", "openai/gpt-fast", "GPT · Fast"),
+      e("other", "openai/gpt-other", "GPT · another-provider"),
+      e("bare", "openai/bare", "(OpenAI) · openai"),
+    ];
+    expect(groupedModelOptions(entries as any).flatMap((g) => g.options.map((o) => o.name)))
+      .toEqual(["Research (Apr-21-2026)", "GPT · Fast", "GPT · another-provider", "(OpenAI) · openai"]);
+  });
 });
