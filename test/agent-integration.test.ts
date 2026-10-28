@@ -455,8 +455,9 @@ class FakeAppServer {
     const promptNumber = ++this.promptCount;
     if (promptText.includes("unconfirmed prompt")) {
       this.cancelablePromptActive = true;
-      // A user/metadata delta is SDK turn evidence, but not model activity.
-      // The following idle status synthesizes success with no reason or runs.
+      // SDK 0.8 no longer treats a user echo alone as turn evidence. Run-tagged
+      // usage is evidence without rendered model activity, so idle still
+      // exercises an actual synthetic completion rather than just a timeout.
       if (promptText.includes("late prior terminal")) {
         this.pushDelta(socket, runtime, {
           message_type: "stop_reason", run_id: "run-cancelled",
@@ -465,6 +466,9 @@ class FakeAppServer {
       } else {
         this.pushDelta(socket, runtime, {
           message_type: "user_message", content: "queued input",
+        });
+        this.pushDelta(socket, runtime, {
+          message_type: "usage_statistics", run_id: `run-unconfirmed-${promptNumber}`,
         });
       }
       const idle = () => socket.push({
@@ -746,8 +750,10 @@ class FakeAppServer {
         run_id: "run-second",
         content: "STILL_WORKING",
       });
-      // The turn tracker was already consumed by the contradicted result, so
-      // the run ends the way post-approval rounds do: on a real idle status.
+      // The listed run remains tracked until its real terminal receipt.
+      this.pushDelta(socket, runtime, {
+        message_type: "stop_reason", run_id: "run-second", stop_reason: "end_turn",
+      });
       socket.push({
         type: "update_loop_status",
         runtime,
@@ -762,8 +768,13 @@ class FakeAppServer {
     delta: WireMessage,
   ): void {
     socket.push({ type: "stream_delta", runtime, delta });
-    // The SDK settles terminal deltas only after the server's usage event.
+    // SDK 0.8 parks stop_reason until turn_finished confirms completion;
+    // usage can follow that terminal event before the result is delivered.
     if (delta.message_type === "stop_reason" && delta.stop_reason !== "requires_approval") {
+      socket.push({
+        type: "turn_finished", runtime, run_id: delta.run_id,
+        stop_reason: delta.stop_reason,
+      });
       socket.push({
         type: "stream_delta",
         runtime,
@@ -909,15 +920,15 @@ describe("Agent SDK app-server integration", () => {
     } finally { agent.shutdown(); }
   });
 
-  test("delivery survives an expired premature-result grace window", async () => {
+  test("delivery survives a turn timing out without a terminal receipt", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server, { prematureResultGraceMs: 5 });
     const { context, updates } = createContext();
     try {
       const session = await openSession(agent, context);
-      expect(await agent.prompt({
+      await expect(agent.prompt({
         sessionId: session.sessionId, prompt: [{ type: "text", text: "silent idle prompt" }],
-      }, context)).toEqual({ stopReason: "end_turn" });
+      }, context)).rejects.toThrow("Timed out waiting for app-server turn");
       server.sendBackgroundReply("AFTER_GRACE");
       await Bun.sleep(30);
       expect(updates.filter((update) =>
@@ -972,11 +983,12 @@ describe("Agent SDK app-server integration", () => {
         url: "https://example.com/sse",
         headers: [],
       },
+      // Legacy unstable transport is still ignored if an untyped client sends it.
       {
         type: "acp",
         name: "in-band",
         serverId: "server-1",
-      },
+      } as unknown as McpServer,
     ];
 
     expect(toSdkMcpServers(servers)).toEqual({
@@ -2531,24 +2543,22 @@ describe("Agent SDK app-server integration", () => {
     }
   });
 
-  test("ends the turn when a contradicted completion is never followed up", async () => {
+  test("reports a bounded error when a listed active run never finishes", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server, { prematureResultGraceMs: 20 });
     const { context } = createContext();
 
     try {
       const session = await openSession(agent, context);
-      // The status was simply stale: nothing follows it. The grace period has
-      // to expire on its own, or the prompt would hang forever.
-      const result = await agent.prompt(
+      // A contradictory idle label is not a successful completion. The SDK's
+      // configured request deadline bounds a run with no terminal receipt.
+      await expect(agent.prompt(
         {
           sessionId: session.sessionId,
           prompt: [{ type: "text", text: "silent idle prompt" }],
         },
         context,
-      );
-
-      expect(result).toEqual({ stopReason: "end_turn" });
+      )).rejects.toThrow("Timed out waiting for app-server turn");
     } finally {
       agent.shutdown();
     }
