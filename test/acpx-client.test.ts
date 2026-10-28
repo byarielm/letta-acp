@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionRegistry } from "../src/session-registry.js";
@@ -13,6 +13,8 @@ type WireMessage = Record<string, unknown>;
 
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 const tempDirs: string[] = [];
+const acpxResponseTimeoutSeconds = process.platform === "win32" ? 15 : 5;
+const acpxTestTimeoutMs = process.platform === "win32" ? 45_000 : 10_000;
 
 afterEach(() => {
   for (const server of servers.splice(0)) server.stop(true);
@@ -131,6 +133,10 @@ function startFakeAppServer(
                 run_id: runId,
                 stop_reason: "end_turn",
               });
+              socket.send(JSON.stringify({
+                type: "turn_finished", runtime: TEST_RUNTIME, run_id: runId,
+                stop_reason: "end_turn",
+              }));
               sendDelta(socket, { message_type: "usage_statistics", run_id: runId });
               onReply?.(() => {
                 sendDelta(socket, {
@@ -139,6 +145,10 @@ function startFakeAppServer(
                 sendDelta(socket, {
                   message_type: "stop_reason", run_id: "run-late", stop_reason: "end_turn",
                 });
+                socket.send(JSON.stringify({
+                  type: "turn_finished", runtime: TEST_RUNTIME, run_id: "run-late",
+                  stop_reason: "end_turn",
+                }));
                 sendDelta(socket, { message_type: "usage_statistics", run_id: "run-late" });
               });
               socket.send(JSON.stringify({
@@ -148,6 +158,9 @@ function startFakeAppServer(
             };
             if (unconfirmedFirst) {
               sendDelta(socket, { message_type: "user_message", content: "queued input" });
+              // Run-tagged usage is non-rendered turn evidence in SDK 0.8;
+              // a user echo alone no longer triggers synthetic completion.
+              sendDelta(socket, { message_type: "usage_statistics", run_id: "run-unconfirmed" });
               socket.send(JSON.stringify({
                 type: "update_loop_status", runtime: TEST_RUNTIME,
                 loop_status: { status: "WAITING_ON_INPUT", active_run_ids: [] },
@@ -217,15 +230,19 @@ async function runAcpx(
 
   const acpxPath = join(import.meta.dir, "..", "node_modules", ".bin", "acpx");
   const agentPath = join(import.meta.dir, "..", "src", "index.ts");
+  // An argv array preserves executable and script paths containing spaces.
+  mkdirSync(join(home, ".acpx"), { recursive: true });
+  writeFileSync(join(home, ".acpx", "config.json"), JSON.stringify({
+    agents: { "test-adapter": { argv: [process.execPath, agentPath] } },
+  }));
   const child = Bun.spawn(
     [
       acpxPath,
-      "--agent",
-      `${process.execPath} ${agentPath}`,
       "--format",
       format,
       "--timeout",
-      "5",
+      String(acpxResponseTimeoutSeconds),
+      "test-adapter",
       ...command,
     ],
     {
@@ -233,6 +250,7 @@ async function runAcpx(
       env: {
         ...process.env,
         HOME: home,
+        USERPROFILE: home,
         LETTA_ACP_BACKEND: "remote",
         LETTA_APP_SERVER_URL: appServerUrl,
         LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
@@ -266,6 +284,7 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
     env: {
       ...process.env,
       HOME: home,
+      USERPROFILE: home,
       LETTA_ACP_BACKEND: "remote",
       LETTA_APP_SERVER_URL: appServerUrl,
       LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
@@ -328,6 +347,8 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
     }
     expect(sessionOpened).toBe(true);
     expect(existsSync(pidFile)).toBe(true);
+    const mcpPid = Number(readFileSync(pidFile, "utf8"));
+    expect(Number.isInteger(mcpPid) && mcpPid > 0).toBe(true);
 
     child.stdin.end();
     const exitCode = await Promise.race([
@@ -337,7 +358,18 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
       }),
     ]);
     expect(exitCode).toBe(0);
-    expect(existsSync(marker)).toBe(true);
+    if (process.platform === "win32") {
+      let processExists = true;
+      try {
+        process.kill(mcpPid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        processExists = false;
+      }
+      expect(processExists).toBe(false);
+    } else {
+      expect(existsSync(marker)).toBe(true);
+    }
   } finally {
     if (child.exitCode === null) child.kill();
     if (existsSync(pidFile) && !existsSync(marker)) {
@@ -360,7 +392,7 @@ describe("acpx client compatibility", () => {
     const home = mkdtempSync(join(tmpdir(), "letta-acp-late-"));
     tempDirs.push(home);
     const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "index.ts")], {
-      env: { ...process.env, HOME: home, LETTA_ACP_BACKEND: "remote",
+      env: { ...process.env, HOME: home, USERPROFILE: home, LETTA_ACP_BACKEND: "remote",
         LETTA_APP_SERVER_URL: url, LETTA_AGENT_ID: TEST_RUNTIME.agent_id },
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -437,12 +469,12 @@ describe("acpx client compatibility", () => {
   test("completes a prompt through a real ACP client", async () => {
     const { stdout } = await runAcpx("quiet");
     expect(stdout.trim()).toBe("ACPX_OK");
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 
   test("a real ACP client waits past an unconfirmed synthetic completion", async () => {
     const { stdout } = await runAcpx("quiet", undefined, false, true);
     expect(stdout.trim()).toBe("ACPX_OK");
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 
   test("records a new ACP session for discovery", async () => {
     const { home, appServerUrl, cwd } = await runAcpx("quiet");
@@ -454,7 +486,7 @@ describe("acpx client compatibility", () => {
     expect(await registry.list(TEST_RUNTIME.agent_id, cwd)).toEqual([
       expect.objectContaining({ sessionId: TEST_RUNTIME.conversation_id, cwd }),
     ]);
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 
   test("lists project sessions through a real ACP client", async () => {
     const cwd = join(import.meta.dir, "..");
@@ -464,10 +496,12 @@ describe("acpx client compatibility", () => {
       true,
     );
 
-    expect(stdout).toContain(TEST_RUNTIME.conversation_id);
-    expect(stdout).toContain("ACP client compatibility session");
-    expect(stdout).toContain(cwd);
-  }, 10_000);
+    expect(JSON.parse(stdout).sessions).toContainEqual(expect.objectContaining({
+      sessionId: TEST_RUNTIME.conversation_id,
+      title: "ACP client compatibility session",
+      cwd,
+    }));
+  }, acpxTestTimeoutMs);
 
   test("waits for MCP subprocess cleanup after the client disconnects", async () => {
     await verifyMcpShutdownOnClientDisconnect();
@@ -497,5 +531,5 @@ describe("acpx client compatibility", () => {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: "ACPX_OK" },
     });
-  }, 10_000);
+  }, acpxTestTimeoutMs);
 });
