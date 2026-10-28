@@ -742,6 +742,12 @@ class FakeAppServer {
       },
     });
     if (!options.thenContinue) return;
+    // Repeated contradictory statuses must not settle or discard the live run.
+    socket.push({
+      type: "update_loop_status",
+      runtime,
+      loop_status: { status: "WAITING_ON_INPUT", active_run_ids: ["run-second"] },
+    });
     // A real server takes a beat before the next step; without the delay the
     // continuation lands in the same microtask batch and hides the race.
     setTimeout(() => {
@@ -2537,6 +2543,18 @@ describe("Agent SDK app-server integration", () => {
       expect(updates).toContainEqual({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: "STILL_WORKING" },
+      });
+      expect(updates.filter((update) =>
+        (update.content as { text?: string } | undefined)?.text === "STILL_WORKING",
+      )).toHaveLength(1);
+      const nextUpdate = updates.length;
+      expect(await agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "plain prompt" }],
+      }, context)).toEqual({ stopReason: "end_turn" });
+      expect(updates.slice(nextUpdate)).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROMPT_OK" },
       });
     } finally {
       agent.shutdown();

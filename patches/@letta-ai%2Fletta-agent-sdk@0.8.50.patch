@@ -1,0 +1,132 @@
+diff --git a/dist/client-entry.js b/dist/client-entry.js
+index 6fc5fbf7617dc027b7f4f0944ee653880e9ca3b3..ad2e3fb1baedd36fe5f4d3ed5ba198cc43853db4 100644
+--- a/dist/client-entry.js
++++ b/dist/client-entry.js
+@@ -13550,6 +13550,17 @@ class RemoteTurnCoordinator {
+       return;
+     for (const runId of activeRunIds)
+       active.runIds.add(runId);
++    if (status === "WAITING_ON_INPUT" && active.abortRequested) {
++      this.completeActiveTurn({
++        runtime: active.runtime,
++        stopReason: "interrupted",
++        runIds: [...active.runIds],
++        success: false,
++        detail: "Interrupted",
++        errorCode: "interrupted"
++      });
++      return;
++    }
+     const hadTurnEvidence = active.observedTurnEvidence || active.observedRequiresApprovalStop;
+     if (!hadTurnEvidence)
+       return;
+@@ -13563,18 +13574,9 @@ class RemoteTurnCoordinator {
+       });
+       return;
+     }
+-    if (status === "WAITING_ON_INPUT" && active.abortRequested) {
+-      this.completeActiveTurn({
+-        runtime: active.runtime,
+-        stopReason: "interrupted",
+-        runIds: [...active.runIds],
+-        success: false,
+-        detail: "Interrupted",
+-        errorCode: "interrupted"
+-      });
+-      return;
+-    }
+     if (status === "WAITING_ON_INPUT" && active.observedTurnEvidence) {
++      if (activeRunIds.length > 0)
++        return;
+       if (active.pendingTerminal || active.observedRunError)
+         return;
+       this.completeActiveTurn({
+diff --git a/dist/index.js b/dist/index.js
+index 1445bb8364e84697b2c82dd27dd82fab63e94c5b..c0a651b3838268fd1b5d87ffd8115c1d9fc37f6a 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -13608,6 +13608,17 @@ class RemoteTurnCoordinator {
+       return;
+     for (const runId of activeRunIds)
+       active.runIds.add(runId);
++    if (status === "WAITING_ON_INPUT" && active.abortRequested) {
++      this.completeActiveTurn({
++        runtime: active.runtime,
++        stopReason: "interrupted",
++        runIds: [...active.runIds],
++        success: false,
++        detail: "Interrupted",
++        errorCode: "interrupted"
++      });
++      return;
++    }
+     const hadTurnEvidence = active.observedTurnEvidence || active.observedRequiresApprovalStop;
+     if (!hadTurnEvidence)
+       return;
+@@ -13621,18 +13632,9 @@ class RemoteTurnCoordinator {
+       });
+       return;
+     }
+-    if (status === "WAITING_ON_INPUT" && active.abortRequested) {
+-      this.completeActiveTurn({
+-        runtime: active.runtime,
+-        stopReason: "interrupted",
+-        runIds: [...active.runIds],
+-        success: false,
+-        detail: "Interrupted",
+-        errorCode: "interrupted"
+-      });
+-      return;
+-    }
+     if (status === "WAITING_ON_INPUT" && active.observedTurnEvidence) {
++      if (activeRunIds.length > 0)
++        return;
+       if (active.pendingTerminal || active.observedRunError)
+         return;
+       this.completeActiveTurn({
+diff --git a/src/remote-turn-coordinator.ts b/src/remote-turn-coordinator.ts
+index e58b55d0acbe5aa36cbd2e6c548630003900bbdd..deed71118f32293e58c89173172d6aefdfd0f3e6 100644
+--- a/src/remote-turn-coordinator.ts
++++ b/src/remote-turn-coordinator.ts
+@@ -399,6 +399,19 @@ export class RemoteTurnCoordinator {
+     if (!active) return;
+     for (const runId of activeRunIds) active.runIds.add(runId);
+ 
++    // Abort can be acknowledged before any model delta arrives. Requiring turn
++    // evidence here strands the tracker and queues its replacement behind it.
++    if (status === "WAITING_ON_INPUT" && active.abortRequested) {
++      this.completeActiveTurn({
++        runtime: active.runtime,
++        stopReason: "interrupted",
++        runIds: [...active.runIds],
++        success: false,
++        detail: "Interrupted",
++        errorCode: "interrupted",
++      });
++      return;
++    }
+     const hadTurnEvidence =
+       active.observedTurnEvidence || active.observedRequiresApprovalStop;
+     if (!hadTurnEvidence) return;
+@@ -413,18 +426,10 @@ export class RemoteTurnCoordinator {
+       });
+       return;
+     }
+-    if (status === "WAITING_ON_INPUT" && active.abortRequested) {
+-      this.completeActiveTurn({
+-        runtime: active.runtime,
+-        stopReason: "interrupted",
+-        runIds: [...active.runIds],
+-        success: false,
+-        detail: "Interrupted",
+-        errorCode: "interrupted",
+-      });
+-      return;
+-    }
+     if (status === "WAITING_ON_INPUT" && active.observedTurnEvidence) {
++      // An idle label cannot settle runs the same status still reports active:
++      // settling them also suppresses their subsequent deltas as late replays.
++      if (activeRunIds.length > 0) return;
+       if (active.pendingTerminal || active.observedRunError) return;
+       this.completeActiveTurn({
+         runtime: active.runtime,

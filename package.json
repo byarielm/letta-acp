@@ -47,10 +47,13 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^2.0.1",
-    "@letta-ai/letta-agent-sdk": "^0.8.50",
+    "@letta-ai/letta-agent-sdk": "0.8.50",
     "@letta-ai/letta-code": "0.34.20"
   },
   "engines": {
     "node": ">=22.19.0"
+  },
+  "patchedDependencies": {
+    "@letta-ai/letta-agent-sdk@0.8.50": "patches/@letta-ai%2Fletta-agent-sdk@0.8.50.patch"
   }
 }

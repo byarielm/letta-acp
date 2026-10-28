@@ -6,7 +6,7 @@
       "name": "acp",
       "dependencies": {
         "@agentclientprotocol/sdk": "^2.0.1",
-        "@letta-ai/letta-agent-sdk": "^0.8.50",
+        "@letta-ai/letta-agent-sdk": "0.8.50",
         "@letta-ai/letta-code": "0.34.20",
       },
       "devDependencies": {
@@ -15,6 +15,9 @@
         "typescript": "^5.9.0",
       },
     },
+  },
+  "patchedDependencies": {
+    "@letta-ai/letta-agent-sdk@0.8.50": "patches/@letta-ai%2Fletta-agent-sdk@0.8.50.patch",
   },
   "packages": {
     "@agentclientprotocol/sdk": ["@agentclientprotocol/sdk@2.0.1", "", { "peerDependencies": { "zod": "^3.25.76 || ^4.0.0" } }, "sha512-v4E/NcBTGFEKmorGso8ysAjJTkNh5UMJPP4aDznyMNmnP9t10g/aCCo/Djy7RYaYZy5ZROFK3G5cEj9tDgGOTQ=="],

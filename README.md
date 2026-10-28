@@ -192,6 +192,13 @@ The rest of the CLI's commands (`/agents`, `/resume`, `/login`, `/statusline`, `
 
 ## How it works
 
+The SDK is pinned to 0.8.50 with a Bun patch in `patches/`. It prevents an idle
+status from settling runs that the same status still lists as active (which
+would discard their later output), and lets abort acknowledgements settle turns
+before any model output arrives. Keep the patch until an SDK release includes
+both fixes; remove it only after the turn-completion and cancellation regressions
+pass against that release. Use `bun install` so the patch is applied.
+
 `src/agent.ts` maps the two protocols:
 
 - Each ACP session becomes a new conversation (`client.createSession`) on one underlying Letta agent, with the ACP `cwd`.
