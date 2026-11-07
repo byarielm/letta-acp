@@ -30,6 +30,7 @@ class FakeAppServer {
   readonly historyRequests: WireMessage[] = [];
   readonly modelRequests: WireMessage[] = [];
   readonly providerRequests: WireMessage[] = [];
+  readonly commandRequests: WireMessage[] = [];
   modelFailuresRemaining = 0;
   modelEntries: LettaCodeModelEntry[] = [
     {
@@ -635,6 +636,7 @@ class FakeAppServer {
   }
 
   private handleCommand(socket: ServerSocket, message: WireMessage): void {
+    this.commandRequests.push(message);
     const runtime = message.runtime as RuntimeScope;
     const command = requiredString(
       message.command_id,
@@ -649,6 +651,16 @@ class FakeAppServer {
       message_type: "slash_command_start",
       command_id: command,
     });
+    if (command === "reflect") {
+      this.pushDelta(socket, runtime, {
+        message_type: "slash_command_end",
+        command_id: command,
+        success: true,
+        output: "Started a reflection pass for this conversation.",
+      });
+      this.activeCommand = null;
+      return;
+    }
     if (command === "init") {
       // Stay silent until the test cancels, reproducing an abort before the
       // command's nested turn emits its first substantive event.
@@ -2632,6 +2644,37 @@ describe("Agent SDK app-server integration", () => {
       agent.shutdown();
     }
   });
+
+  test.each([undefined, "--instruction Remember the architecture decisions"])(
+    "dispatches manual reflection to the harness with args %s",
+    async (args) => {
+      const server = new FakeAppServer();
+      const agent = createAgent(server);
+      const { context, updates, permissionRequests } = createContext();
+      try {
+        const session = await openSession(agent, context);
+        expect(await agent.prompt({
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: args ? `/reflect ${args}` : "/reflect" }],
+        }, context)).toEqual({ stopReason: "end_turn" });
+        expect(server.commandRequests).toHaveLength(1);
+        expect(server.commandRequests[0]).toMatchObject({
+          type: "execute_command",
+          command_id: "reflect",
+          runtime: { conversation_id: session.sessionId },
+          ...(args ? { args } : {}),
+        });
+        if (!args) expect(server.commandRequests[0]).not.toHaveProperty("args");
+        expect(permissionRequests).toHaveLength(0);
+        expect(updates).toContainEqual({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Started a reflection pass for this conversation." },
+        });
+      } finally {
+        agent.shutdown();
+      }
+    },
+  );
 
   test("recovers an execute command after an approved tool call", async () => {
     const server = new FakeAppServer();

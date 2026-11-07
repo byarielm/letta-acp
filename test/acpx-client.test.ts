@@ -102,6 +102,18 @@ function startFakeAppServer(
               available_handles: ["test/model"],
             }));
             return;
+          case "execute_command": {
+            expect(message.command_id).toBe("reflect");
+            expect(message.args).toBe("--instruction Remember architecture decisions");
+            sendDelta(socket, { message_type: "slash_command_start", command_id: "reflect" });
+            sendDelta(socket, {
+              message_type: "slash_command_end",
+              command_id: "reflect",
+              success: true,
+              output: "Started a reflection pass for this conversation.",
+            });
+            return;
+          }
           case "input": {
             const payload = message.payload as WireMessage;
             if (payload.kind !== "create_message") return;
@@ -252,6 +264,8 @@ async function runAcpx(
         HOME: home,
         USERPROFILE: home,
         LETTA_ACP_BACKEND: "remote",
+        // Do not inherit a live Zed model override: this server has no model-switch handler.
+        LETTA_ACP_MODEL: undefined,
         LETTA_APP_SERVER_URL: appServerUrl,
         LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
       },
@@ -286,6 +300,7 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
       HOME: home,
       USERPROFILE: home,
       LETTA_ACP_BACKEND: "remote",
+      LETTA_ACP_MODEL: undefined,
       LETTA_APP_SERVER_URL: appServerUrl,
       LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
     },
@@ -393,6 +408,7 @@ describe("acpx client compatibility", () => {
     tempDirs.push(home);
     const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "index.ts")], {
       env: { ...process.env, HOME: home, USERPROFILE: home, LETTA_ACP_BACKEND: "remote",
+        LETTA_ACP_MODEL: undefined,
         LETTA_APP_SERVER_URL: url, LETTA_AGENT_ID: TEST_RUNTIME.agent_id },
       stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
@@ -424,6 +440,11 @@ describe("acpx client compatibility", () => {
           if (message.error) throw new Error(JSON.stringify(message.error));
           if (message.params?.update?.sessionUpdate === "available_commands_update") {
             expect(sessionId).not.toBe("");
+            expect(message.params.update.availableCommands).toContainEqual({
+              name: "reflect",
+              description: "Start a manual reflection pass on the current conversation",
+              input: { hint: "--instruction <focus> (optional)" },
+            });
             commandsReceived = true;
           }
           if (message.params?.update?.content?.text === "ACPX_OK") replies += 1;
@@ -469,6 +490,13 @@ describe("acpx client compatibility", () => {
   test("completes a prompt through a real ACP client", async () => {
     const { stdout } = await runAcpx("quiet");
     expect(stdout.trim()).toBe("ACPX_OK");
+  }, acpxTestTimeoutMs);
+
+  test("dispatches manual reflection through a real ACP client", async () => {
+    const { stdout } = await runAcpx("quiet", [
+      "exec", "/reflect --instruction Remember architecture decisions",
+    ]);
+    expect(stdout.trim()).toBe("Started a reflection pass for this conversation.");
   }, acpxTestTimeoutMs);
 
   test("a real ACP client waits past an unconfirmed synthetic completion", async () => {

@@ -185,19 +185,14 @@ ACP session ids are Letta conversation ids, so `session/load` works across adapt
 The adapter advertises the [Letta slash commands](https://docs.letta.com/platform/cli/slash-commands) that make sense over ACP, so they appear in the client's `/` menu:
 
 - **Adapter-native**: `/model`.
-- **Harness-executed** (via the app-server `execute_command` protocol): `/clear`, `/compact`, `/init`, `/doctor`, `/remember`, `/context-limit`, `/reload`, `/toolset`. Commands that run a full agent turn (`/init`, `/remember`, `/doctor`) stream their tool calls and output like any prompt.
+- **Harness-executed** (via the app-server `execute_command` protocol): `/clear`, `/compact`, `/init`, `/doctor`, `/remember`, `/reflect`, `/context-limit`, `/reload`, `/toolset`. Commands that run a full agent turn (`/init`, `/remember`, `/doctor`) stream their tool calls and output like any prompt.
 - **Model-interpreted**: `/memory`, `/search`, `/skills`, `/skill-creator`, plus every skill discovered on disk (bundled with letta-code, `~/.letta/skills`, and the session cwd's `.claude/skills`) — these forward as prompt text, which the harness instructs the model to treat as a skill invocation.
 
 The rest of the CLI's commands (`/agents`, `/resume`, `/login`, `/statusline`, `/exit`, …) are TUI dialogs or local-process controls with no protocol equivalent; use the editor's own UI for those (new thread ≈ `/new`, thread history ≈ `/resume`).
 
 ## How it works
 
-The SDK is pinned to 0.8.50 with a Bun patch in `patches/`. It prevents an idle
-status from settling runs that the same status still lists as active (which
-would discard their later output), and lets abort acknowledgements settle turns
-before any model output arrives. Keep the patch until an SDK release includes
-both fixes; remove it only after the turn-completion and cancellation regressions
-pass against that release. Use `bun install` so the patch is applied.
+The SDK is pinned to 0.8.50 with a Bun patch in `patches/`. It prevents an idle status from settling runs that the same status still lists as active (which would discard their later output), and lets abort acknowledgements settle turns before any model output arrives. Keep the patch until an SDK release includes both fixes; remove it only after the turn-completion and cancellation regressions pass against that release. Use `bun install` so the patch is applied.
 
 `src/agent.ts` maps the two protocols:
 

@@ -38,6 +38,11 @@ export const EXECUTE_COMMANDS: ExecuteCommandSpec[] = [
     hint: "what to remember (empty to infer from context)",
   },
   {
+    name: "reflect",
+    description: "Start a manual reflection pass on the current conversation",
+    hint: "--instruction <focus> (optional)",
+  },
+  {
     name: "context-limit",
     description: "Set or reset the max context window",
     hint: "tokens (empty to show current)",
