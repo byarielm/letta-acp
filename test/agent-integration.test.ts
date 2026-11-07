@@ -37,6 +37,19 @@ class FakeAppServer {
   readonly conversationSummaries = new Map<string, string>();
   historyMessages: WireMessage[] = [];
   private scratchConversations = new Set<string>();
+  agentState: WireMessage = { id: "agent-test" };
+  conversationState: WireMessage = {};
+  modelUpdateGate?: Promise<void>;
+  modelUpdateFailuresRemaining = 0;
+  metadataUnavailable = false;
+  metadataGate?: Promise<void>;
+  persistModelUpdates = false;
+  failModelAcknowledgement = false;
+  readonly inputMessages: WireMessage[] = [];
+  private modelUpdateWaiters: Array<() => void> = [];
+  nextModelUpdate(): Promise<void> {
+    return new Promise((resolve) => this.modelUpdateWaiters.push(resolve));
+  }
   deviceStatus: WireMessage = { current_available_skills: [] };
   commandOutputs: Record<string, string> = {};
   reloadDeviceStatus?: WireMessage;
@@ -324,8 +337,16 @@ class FakeAppServer {
             agent_id: conversationId.includes("foreign") ? "agent-other" : "agent-test",
             archived: conversationId.includes("archived"),
             summary: this.conversationSummaries.get(conversationId),
+            ...this.conversationState,
           },
         });
+        return;
+      }
+      case "agent_retrieve": {
+        const response = { type: "agent_retrieve_response", request_id: message.request_id,
+          success: !this.metadataUnavailable, ...(this.metadataUnavailable ? { error: "metadata unavailable" } : { agent: this.agentState }) };
+        if (this.metadataGate) void this.metadataGate.then(() => socket.push(response));
+        else socket.push(response);
         return;
       }
       case "conversation_update": {
@@ -393,6 +414,7 @@ class FakeAppServer {
       case "update_model": {
         const payload = message.payload as WireMessage;
         this.updatedModelPayloads.push(payload);
+        for (const waiter of this.modelUpdateWaiters.splice(0)) waiter();
         const modelHandle =
           typeof payload.model_handle === "string" ? payload.model_handle : undefined;
         const modelId =
@@ -404,19 +426,36 @@ class FakeAppServer {
         const handle =
           modelHandle ??
           this.modelEntries.find((entry) => entry.id === modelId)?.handle ?? "test/model";
+        const respond = () => {
+        if (this.modelUpdateFailuresRemaining > 0) {
+          this.modelUpdateFailuresRemaining--;
+          socket.push({ type: "update_model_response", request_id: message.request_id, success: false, error: "model update rejected" });
+          return;
+        }
+        if (this.persistModelUpdates) {
+          const entry = this.modelEntries.find((item) => item.id === modelId);
+          this.conversationState.model = handle;
+          this.conversationState.context_window_limit = entry?.updateArgs?.context_window;
+          this.conversationState.model_settings = { reasoning: { reasoning_effort: entry?.updateArgs?.reasoning_effort } };
+        }
         this.onModelUpdateResponse?.();
         socket.push({
           type: "update_model_response",
           request_id: requiredString(message.request_id, "update_model.request_id"),
-          success: true,
+          success: !this.failModelAcknowledgement,
+          ...(this.failModelAcknowledgement ? { error: "acknowledgement unavailable after persistence" } : {}),
           runtime: message.runtime,
           applied_to: "conversation",
           model_id: modelId,
           model_handle: handle,
         });
+        };
+        if (this.modelUpdateGate) void this.modelUpdateGate.then(respond);
+        else respond();
         return;
       }
       case "input":
+        this.inputMessages.push(message);
         this.handleInput(socket, message);
         return;
       case "sync": {
@@ -954,6 +993,195 @@ async function openSession(
 }
 
 describe("Agent SDK app-server integration", () => {
+  test("an internal preflight read does not count as a delivered picker update", async () => {
+    const server = new FakeAppServer();
+    server.agentState = { id: "agent-test", model: "test/model" };
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      server.conversationState = { model: "test/other-model" };
+      server.modelUpdateFailuresRemaining = 1;
+      await expect(agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "test-model" }))
+        .rejects.toThrow("model update rejected");
+      expect(updates.some((update) => update.sessionUpdate === "config_option_update" &&
+        Array.isArray(update.configOptions) && update.configOptions.some((option: { id?: string; currentValue?: unknown }) =>
+          option.id === "model" && option.currentValue === "other-model"))).toBe(true);
+    } finally { agent.shutdown(); }
+  });
+
+  test("refreshes the actual picker state when a failed acknowledgement follows a persisted write", async () => {
+    const server = new FakeAppServer();
+    server.agentState = { id: "agent-test", model: "test/model" };
+    server.persistModelUpdates = true;
+    server.failModelAcknowledgement = true;
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      await expect(agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "other-model" }))
+        .rejects.toThrow("acknowledgement unavailable");
+      expect(updates.some((update) => update.sessionUpdate === "config_option_update" &&
+        Array.isArray(update.configOptions) && update.configOptions.some((option: { id?: string; currentValue?: unknown }) =>
+          option.id === "model" && option.currentValue === "other-model"))).toBe(true);
+      const actual = await agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "permissions", value: "standard" });
+      expect(actual.configOptions.find((option) => option.id === "model")?.currentValue).toBe("other-model");
+    } finally { agent.shutdown(); }
+  });
+
+  test("reports the persisted tier when the runtime normalizes an acknowledged update", async () => {
+    const server = new FakeAppServer();
+    server.modelEntries = [
+      { id: "reasoner-low", handle: "test/reasoner", label: "Low", description: "", updateArgs: { reasoning_effort: "low", context_window: 8192 } },
+      { id: "reasoner-high", handle: "test/reasoner", label: "High", description: "", isFeatured: true, updateArgs: { reasoning_effort: "high", context_window: 8192 } },
+    ];
+    server.agentState = { id: "agent-test", model: "test/reasoner", context_window_limit: 8192,
+      model_settings: { reasoning: { reasoning_effort: "high" } } };
+    server.persistModelUpdates = true;
+    server.onModelUpdateResponse = () => {
+      server.conversationState.model_settings = { reasoning: { reasoning_effort: "high" } };
+    };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const result = await agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "thought_level", value: "low" });
+      expect(server.updatedModelPayloads).toEqual([{ model_id: "reasoner-low" }]);
+      expect(result.configOptions.find((option) => option.id === "thought_level")?.currentValue).toBe("high");
+    } finally { agent.shutdown(); }
+  });
+
+  test("unavailable or malformed metadata cannot replace the last known selection with a default", async () => {
+    const server = new FakeAppServer();
+    server.agentState = { id: "agent-test", model: "test/other-model" };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(session.configOptions?.find((option) => option.id === "model")?.currentValue).toBe("other-model");
+      server.metadataUnavailable = true;
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Check the existing selection" }] }, context);
+      const unchanged = await agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "permissions", value: "standard" });
+      expect(unchanged.configOptions.find((option) => option.id === "model")?.currentValue).toBe("other-model");
+      server.metadataUnavailable = false;
+      server.agentState = { model: 42 };
+      const restored = await agent.loadSession({ sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+      expect(restored.configOptions?.find((option) => option.id === "model")?.currentValue).toBe("other-model");
+    } finally { agent.shutdown(); }
+  });
+
+  test("serializes admitted configuration changes before a prompt and rejects later changes", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    let release!: () => void;
+    try {
+      const session = await openSession(agent, context);
+      server.modelUpdateGate = new Promise((resolve) => { release = resolve; });
+      const started = server.nextModelUpdate();
+      const first = agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "other-model" });
+      await started;
+      const second = agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "test-model" });
+      const mode = agent.setSessionMode({ sessionId: session.sessionId, modeId: "unrestricted" }, context);
+      const prompt = agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Use the final configuration" }] }, context);
+      await expect(agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "other-model" })).rejects.toThrow("prompt");
+      await expect(agent.setSessionMode({ sessionId: session.sessionId, modeId: "standard" }, context)).rejects.toThrow("prompt");
+      expect(server.updatedModelPayloads).toHaveLength(1);
+      expect(server.inputMessages).toHaveLength(0);
+      release();
+      await Promise.all([first, second, mode]);
+      expect(await prompt).toEqual({ stopReason: "end_turn" });
+      expect(server.updatedModelPayloads).toEqual([{ model_id: "other-model" }, { model_id: "test-model" }]);
+      expect(updates).toContainEqual({ sessionUpdate: "current_mode_update", currentModeId: "unrestricted" });
+    } finally { release?.(); agent.shutdown(); }
+  });
+
+  test("a rejected queued configuration does not poison later changes or prompt admission", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let release!: () => void;
+    try {
+      const session = await openSession(agent, context);
+      server.modelUpdateGate = new Promise((resolve) => { release = resolve; });
+      server.modelUpdateFailuresRemaining = 1;
+      const started = server.nextModelUpdate();
+      const first = agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "other-model" })
+        .then(() => null, (error: Error) => error);
+      await started;
+      const second = agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "other-model" });
+      const prompt = agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Continue after the rejected change" }] }, context);
+      release();
+      expect(await first).toBeInstanceOf(Error);
+      expect((await second).configOptions.find((option) => option.id === "model")?.currentValue).toBe("other-model");
+      expect(await prompt).toEqual({ stopReason: "end_turn" });
+    } finally { release?.(); agent.shutdown(); }
+  });
+
+  test("cancelling prompt admission does not abort the idle SDK stream or wait for a gated write", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let release!: () => void;
+    try {
+      const session = await openSession(agent, context);
+      server.modelUpdateGate = new Promise((resolve) => { release = resolve; });
+      const started = server.nextModelUpdate();
+      const change = agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "other-model" });
+      await started;
+      const prompt = agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Cancel before sending" }] }, context);
+      await agent.cancel({ sessionId: session.sessionId });
+      expect(await Promise.race([prompt, Bun.sleep(100).then(() => { throw new Error("Cancellation waited for a configuration write"); })]))
+        .toEqual({ stopReason: "cancelled" });
+      expect(server.inputMessages).toHaveLength(0);
+      release();
+      await change;
+      expect(await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "A normal next turn" }] }, context))
+        .toEqual({ stopReason: "end_turn" });
+    } finally { release?.(); agent.shutdown(); }
+  });
+
+  test("refreshes the picker from externally persisted settings after a turn", async () => {
+    const server = new FakeAppServer();
+    server.agentState = { id: "agent-test", model: "test/model" };
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      server.conversationState = { model: "test/other-model" };
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Check the effective model" }] }, context);
+      const synced = await agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "permissions", value: "standard" });
+      expect(synced.configOptions.find((option) => option.id === "model")?.currentValue).toBe("other-model");
+      expect(updates.some((update) => update.sessionUpdate === "config_option_update" &&
+        Array.isArray(update.configOptions) && update.configOptions.some((option: { id?: string; currentValue?: unknown }) =>
+          option.id === "model" && option.currentValue === "other-model"))).toBe(true);
+      expect(server.updatedModelPayloads).toHaveLength(0);
+    } finally { agent.shutdown(); }
+  });
+
+  test("a replaced runtime rejects old queued writes and discards stale readback", async () => {
+    const server = new FakeAppServer();
+    server.agentState = { id: "agent-test", model: "test/model" };
+    const agent = createAgent(server);
+    const { context } = createContext();
+    let release!: () => void;
+    try {
+      const session = await openSession(agent, context);
+      server.metadataGate = new Promise((resolve) => { release = resolve; });
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Trigger readback" }] }, context);
+      await Bun.sleep(1);
+      const queued = agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "model", value: "other-model" })
+        .then(() => null, (error: Error) => error);
+      server.agentState = { id: "agent-test", model: "test/other-model" };
+      const replacement = agent.loadSession({ sessionId: session.sessionId, cwd: "/tmp/different-project", mcpServers: [] }, context);
+      await Bun.sleep(1);
+      release();
+      expect(await queued).toBeInstanceOf(Error);
+      expect((await replacement).configOptions?.find((option) => option.id === "model")?.currentValue).toBe("other-model");
+      expect(server.updatedModelPayloads).toHaveLength(0);
+    } finally { release?.(); agent.shutdown(); }
+  });
+
   test("automatic local naming runs behind prompt completion and can be cancelled", async () => {
     const server = new FakeAppServer();
     server.historyMessages = [{ id: "u", message_type: "user_message", content: "Name the ACP work" },

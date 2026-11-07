@@ -11,6 +11,24 @@ interface RuntimeScope {
 
 type WireMessage = Record<string, unknown>;
 
+interface FakeConfiguration {
+  agent?: WireMessage;
+  conversation?: WireMessage;
+  updateGate?: Promise<void>;
+  onUpdate?(payload: WireMessage): void;
+  onInput?(conversation: WireMessage): void;
+}
+
+const CONFIGURATION_CATALOG = [
+  { id: "test-model", handle: "test/model", label: "Test Model", description: "Deterministic test model", isDefault: true },
+  { id: "test-reasoner-low", handle: "test/reasoner", label: "Reasoner Low", description: "Small context, low reasoning",
+    updateArgs: { reasoning_effort: "low", context_window: 8192 } },
+  { id: "test-reasoner-high", handle: "test/reasoner", label: "Reasoner High", description: "Small context, high reasoning", isFeatured: true,
+    updateArgs: { reasoning_effort: "high", context_window: 8192 } },
+  { id: "test-reasoner-large-high", handle: "test/reasoner", label: "Reasoner Large", description: "Large context, high reasoning",
+    updateArgs: { reasoning_effort: "high", context_window: 32768 } },
+];
+
 const servers: Array<ReturnType<typeof Bun.serve>> = [];
 const tempDirs: string[] = [];
 const acpxResponseTimeoutSeconds = process.platform === "win32" ? 15 : 5;
@@ -27,10 +45,13 @@ function startFakeAppServer(
   onReply?: (emitLate: () => void) => void,
   unconfirmedFirst = false,
   history: WireMessage[] = [],
+  configuration: FakeConfiguration = {},
 ) {
   let replyCount = 0;
   let reloaded = false;
   let conversationTitle = TEST_CONVERSATION.summary;
+  const savedAgent = configuration.agent ?? { id: TEST_RUNTIME.agent_id, model: "test/model", context_window_limit: 8192 };
+  const savedConversation = configuration.conversation ?? {};
   const server = Bun.serve<{ channel: "control" | "stream" }>({
     hostname: "127.0.0.1",
     port: 0,
@@ -83,8 +104,12 @@ function startFakeAppServer(
               type: "conversation_retrieve_response",
               request_id: requiredString(message.request_id),
               success: true,
-              conversation: { ...TEST_CONVERSATION, summary: conversationTitle },
+              conversation: { ...TEST_CONVERSATION, summary: conversationTitle, ...savedConversation },
             }));
+            return;
+          case "agent_retrieve":
+            socket.send(JSON.stringify({ type: "agent_retrieve_response", request_id: message.request_id,
+              success: true, agent: savedAgent }));
             return;
           case "conversation_update": {
             const body = message.body as WireMessage;
@@ -118,16 +143,28 @@ function startFakeAppServer(
               type: "list_models_response",
               request_id: requiredString(message.request_id),
               success: true,
-              entries: [{
-                id: "test-model",
-                handle: "test/model",
-                label: "Test Model",
-                description: "Deterministic test model",
-                isDefault: true,
-              }],
-              available_handles: ["test/model"],
+              entries: CONFIGURATION_CATALOG,
+              available_handles: ["test/model", "test/reasoner"],
             }));
             return;
+          case "update_model": {
+            const payload = message.payload as WireMessage;
+            configuration.onUpdate?.(payload);
+            const apply = () => {
+              const selected = CONFIGURATION_CATALOG.find((entry) => entry.id === payload.model_id)
+                ?? CONFIGURATION_CATALOG.find((entry) => entry.handle === payload.model_handle);
+              if (!selected) throw new Error(`Unknown test model ${JSON.stringify(payload)}`);
+              savedConversation.model = selected.handle;
+              const effort = payload.reasoning_effort ?? selected.updateArgs?.reasoning_effort;
+              savedConversation.model_settings = effort ? { reasoning: { reasoning_effort: effort } } : {};
+              savedConversation.context_window_limit = payload.context_window ?? selected.updateArgs?.context_window ?? 8192;
+              socket.send(JSON.stringify({ type: "update_model_response", request_id: message.request_id,
+                success: true, model_id: selected.id, model_handle: selected.handle }));
+            };
+            if (configuration.updateGate) void configuration.updateGate.then(apply);
+            else apply();
+            return;
+          }
           case "execute_command": {
             const command = message.command_id;
             let output: string;
@@ -156,6 +193,7 @@ function startFakeAppServer(
           case "input": {
             const payload = message.payload as WireMessage;
             if (payload.kind !== "create_message") return;
+            configuration.onInput?.({ ...savedConversation });
             const reply = () => {
               const runId = `run-acpx-${++replyCount}`;
               sendDelta(socket, {
@@ -442,7 +480,129 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
   }
 }
 
+async function driveConfigurationScenario(
+  url: string,
+  handle: (message: any, send: (id: number, method: string, params: unknown) => void) => boolean | void,
+): Promise<void> {
+  const home = mkdtempSync(join(tmpdir(), "letta-acp-config-"));
+  tempDirs.push(home);
+  const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "index.ts")], {
+    env: { ...process.env, HOME: home, USERPROFILE: home, LETTA_ACP_BACKEND: "remote",
+      LETTA_ACP_MODEL: undefined, LETTA_ACP_NAMING_MODE: "off", LETTA_APP_SERVER_URL: url,
+      LETTA_AGENT_ID: TEST_RUNTIME.agent_id },
+    stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  });
+  const stderr = new Response(child.stderr).text();
+  const send = (id: number, method: string, params: unknown) => {
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    child.stdin.flush();
+  };
+  let complete = false;
+  const received: unknown[] = [];
+  let buffer = "";
+  const decoder = new TextDecoder();
+  const timer = setTimeout(() => child.kill(), process.platform === "win32" ? 20_000 : 8_000);
+  try {
+    send(1, "initialize", { protocolVersion: 1, clientCapabilities: {} });
+    outer: for await (const chunk of child.stdout) {
+      buffer += decoder.decode(chunk, { stream: true });
+      let newline: number;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line.trim()) continue;
+        const message = JSON.parse(line);
+        received.push({ id: message.id, error: message.error, update: message.params?.update?.sessionUpdate,
+          options: (message.result?.configOptions ?? message.params?.update?.configOptions)?.map((option: any) =>
+            ({ id: option.id, currentValue: option.currentValue })) });
+        if (message.id === 1) send(2, "session/new", { cwd: home, mcpServers: [] });
+        if (handle(message, send)) { complete = true; break outer; }
+      }
+    }
+    if (!complete) throw new Error(`Configuration stdio scenario did not complete: ${JSON.stringify(received.slice(-12))}\n${await stderr}`);
+  } finally {
+    clearTimeout(timer);
+    child.stdin.end();
+    if (child.exitCode === null) child.kill();
+    await child.exited;
+    await stderr;
+  }
+}
+
 describe("acpx client compatibility", () => {
+  test("stdio restores persisted variants, refreshes slash-model selection, and orders changes before prompts", async () => {
+    const updates: WireMessage[] = [];
+    const inputs: WireMessage[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let coordinating = false;
+    const configuration: FakeConfiguration = {
+      agent: { id: TEST_RUNTIME.agent_id, model: "test/model", context_window_limit: 8192 },
+      conversation: { model: "test/reasoner", context_window_limit: 32768,
+        model_settings: { reasoning: { reasoning_effort: "high" } } },
+      onUpdate(payload) { if (coordinating) updates.push(payload); },
+      onInput(conversation) { inputs.push(conversation); },
+    };
+    const url = startFakeAppServer(undefined, false, [], configuration);
+    let sessionId = "";
+    let slashReturned = false;
+    let slashPickerUpdated = false;
+    let queued = false;
+    let highConfirmed = false;
+    let lowConfirmed = false;
+    let lateChangeRejected = false;
+    const value = (options: any[], id: string) => options.find((option) => option.id === id)?.currentValue;
+    try {
+      await driveConfigurationScenario(url, (message, send) => {
+        if (message.error) {
+          expect(message.id).toBe(13);
+          expect(message.error.message).toMatch(/prompt/i);
+          expect(inputs).toHaveLength(0);
+          lateChangeRejected = true;
+          release();
+        }
+        if (message.id === 2) {
+          sessionId = message.result.sessionId;
+          expect(value(message.result.configOptions, "model")).toBe("test-reasoner-large-high");
+          expect(value(message.result.configOptions, "thought_level")).toBe("high");
+          send(3, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/model test-model" }] });
+        }
+        if (message.id === 3) {
+          expect(message.result.stopReason).toBe("end_turn");
+          slashReturned = true;
+        }
+        if (message.params?.update?.sessionUpdate === "config_option_update" &&
+            value(message.params.update.configOptions, "model") === "test-model") slashPickerUpdated = true;
+        if (slashReturned && slashPickerUpdated && !queued) {
+          queued = true;
+          coordinating = true;
+          configuration.updateGate = gate;
+          send(10, "session/set_config_option", { sessionId, configId: "model", value: "test-reasoner-high" });
+          send(11, "session/set_config_option", { sessionId, configId: "thought_level", value: "low" });
+          send(12, "session/prompt", { sessionId, prompt: [{ type: "text", text: "Use the saved configuration" }] });
+          send(13, "session/set_config_option", { sessionId, configId: "model", value: "test-model" });
+        }
+        if (message.id === 10) {
+          expect(value(message.result.configOptions, "thought_level")).toBe("high");
+          highConfirmed = true;
+        }
+        if (message.id === 11) {
+          expect(value(message.result.configOptions, "thought_level")).toBe("low");
+          lowConfirmed = true;
+        }
+        if (message.id === 12) {
+          expect(message.result.stopReason).toBe("end_turn");
+          expect(highConfirmed && lowConfirmed && lateChangeRejected).toBe(true);
+          expect(updates).toHaveLength(2);
+          expect(updates[0]?.model_id).toBe("test-reasoner-high");
+          expect(inputs).toEqual([expect.objectContaining({ model: "test/reasoner", context_window_limit: 8192,
+            model_settings: { reasoning: { reasoning_effort: "low" } } })]);
+          return true;
+        }
+      });
+    } finally { release(); }
+  }, process.platform === "win32" ? 25_000 : 10_000);
+
   test("stdio delivers a background response after the prompt result without new input", async () => {
     let emitLate: (() => void) | undefined;
     const url = startFakeAppServer((emit) => { emitLate = emit; });
@@ -577,6 +737,12 @@ describe("acpx client compatibility", () => {
     // Even an immediate prompt on a fresh session must wait for discovery.
     const { stdout } = await runAcpx("quiet", ["exec", "/project-status src"]);
     expect(stdout.trim()).toBe("PROJECT_STATUS_OK");
+  }, acpxTestTimeoutMs);
+
+  test("switches models while accepting picker refresh notifications through a real ACP client", async () => {
+    const { stdout } = await runAcpx("quiet", ["exec", "/model test-reasoner-high"]);
+    expect(stdout).toContain("Model switched to");
+    expect(stdout).toContain("test/reasoner");
   }, acpxTestTimeoutMs);
 
   test("persists an exact conversation rename through a real ACP client", async () => {

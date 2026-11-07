@@ -13,6 +13,7 @@ import {
   type NewSessionRequest,
   type NewSessionResponse,
   PROTOCOL_VERSION,
+  RequestError,
   type PromptRequest,
   type PromptResponse,
   type RequestPermissionResponse,
@@ -39,6 +40,7 @@ import {
 import { authMethodsForClient } from "./auth.js";
 import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
 import { debug } from "./debug.js";
+import { modelSnapshot } from "./model-settings.js";
 import { ConversationNamer } from "./conversation-naming.js";
 import { titleMessagesFromHistory, type NamingMode, type TitleMessage } from "./conversation-title.js";
 import {
@@ -113,6 +115,15 @@ interface AcpSessionState {
   cancelled: boolean;
   /** True only while a session/prompt handler is running. */
   promptActive: boolean;
+  /** Serializes configuration mutations and post-prompt refreshes. */
+  configTail: Promise<void>;
+  configEpoch: number;
+  waitingForConfiguration?: boolean;
+  cancelConfigurationWait?: () => void;
+  modelRefresh?: Promise<void>;
+  advertisedConfig?: string;
+  contextWindow?: number;
+  settingsConfirmed?: boolean;
   /** ACP session mode; enforced adapter-side in the permission callback. */
   modeId: PermissionMode;
   /** Session working directory. */
@@ -273,6 +284,7 @@ export class LettaAcpAgent {
     await this.rememberSession(agentId, sessionId, params.cwd);
     log(`session ${sessionId} -> agent ${agentId} (cwd: ${params.cwd})`);
     const configOptions = await this.sessionConfigOptions(state);
+    state.advertisedConfig = JSON.stringify(configOptions);
     this.startReader(sessionId, state);
     log(`timing: new session ${Math.round(performance.now() - started)}ms`);
     // The SDK queues the response in a promise continuation. Wait until the
@@ -349,6 +361,7 @@ export class LettaAcpAgent {
     log(`loaded session ${sessionId} (${updates.length} replayed updates)`);
     this.announceCommands(sessionId, cx);
     const configOptions = await this.sessionConfigOptions(state);
+    state.advertisedConfig = JSON.stringify(configOptions);
     this.startReader(sessionId, state);
     log(`timing: load session ${Math.round(performance.now() - started)}ms`);
     return {
@@ -541,12 +554,21 @@ export class LettaAcpAgent {
     // tiers are separate catalog entries, but the tier is picked through the
     // thought-level option, so the picker must not repeat the model per tier.
     const variants = collapseVariants(models);
-    const active =
-      models.find((entry) => entry.id === state.currentModel) ??
-      models.find((entry) => entry.handle === state.currentModel);
+    const exact = models.find((entry) => entry.id === state.currentModel);
+    const handle = exact?.handle ?? state.currentModel;
+    const matchesContext = (entry: (typeof models)[number]) => state.contextWindow === undefined ||
+      entry.updateArgs?.context_window === undefined || entry.updateArgs.context_window === state.contextWindow;
+    const candidates = models.filter((entry) => entry.handle === handle &&
+      matchesContext(entry));
+    const scoped = state.contextWindow === undefined ? [] : candidates.filter((entry) =>
+      entry.updateArgs?.context_window === state.contextWindow);
+    const preferred = scoped.length ? scoped : candidates;
+    const active = (exact && matchesContext(exact) ? exact : undefined)
+      ?? preferred.find((entry) => entryReasoningEffort(entry) === state.reasoningEffort)
+      ?? (state.contextWindow !== undefined || collapseVariants(preferred).length <= 1 ? preferred[0] : undefined);
     let currentValue = active
       ? (variantOf(active, variants)?.id ?? active.id)
-      : (variants.find((entry) => entry.isDefault)?.id ?? variants[0]?.id);
+      : undefined;
     const options = groupedModelOptions(variants);
 
     // A custom model handle may be active even when it is not in the curated
@@ -579,8 +601,7 @@ export class LettaAcpAgent {
     const thoughtLevel = thoughtLevelConfigOption(
       models,
       active?.handle ?? state.currentModel,
-      state.reasoningEffort ??
-        (active ? entryReasoningEffort(active) : undefined),
+      state.reasoningEffort ?? (!state.settingsConfirmed && exact ? entryReasoningEffort(exact) : undefined),
     );
     if (thoughtLevel) {
       configOptions.push(thoughtLevel);
@@ -614,7 +635,102 @@ export class LettaAcpAgent {
     return configOptions;
   }
 
+  private async hydrateModelSettings(state: AcpSessionState): Promise<boolean> {
+    const id = state.session.conversationId;
+    const epoch = state.configEpoch;
+    if (!id || this.sessions.get(id) !== state) return false;
+    try {
+      const [agent, conversation] = await Promise.all([
+        state.session.agentId ? this.client.agents.retrieve(state.session.agentId) : undefined,
+        id === "default" ? undefined : this.client.conversations.retrieve(id),
+      ]);
+      if (this.sessions.get(id) !== state || state.configEpoch !== epoch) return false;
+      const snapshot = modelSnapshot(agent, conversation);
+      if (!snapshot) return false;
+      state.currentModel = snapshot.model ?? state.currentModel;
+      state.settingsConfirmed = true;
+      state.reasoningEffort = snapshot.reasoningEffort;
+      state.contextWindow = snapshot.contextWindow;
+      return true;
+    } catch {
+      log("persisted model settings unavailable; retaining last known configuration");
+      return false;
+    }
+  }
+
+  private scheduleModelRefresh(sessionId: string, state: AcpSessionState): void {
+    if (state.modelRefresh || this.sessions.get(sessionId) !== state) return;
+    const epoch = state.configEpoch;
+    const refresh = state.configTail.then(async () => {
+      if (this.sessions.get(sessionId) !== state || state.configEpoch !== epoch) return;
+      await this.publishModelRefresh(sessionId, state);
+    }).catch(() => { log("persisted configuration refresh unavailable"); });
+    state.configTail = refresh;
+    state.modelRefresh = refresh;
+    void refresh.finally(() => { if (state.modelRefresh === refresh) state.modelRefresh = undefined; });
+  }
+
+  private async publishModelRefresh(sessionId: string, state: AcpSessionState): Promise<void> {
+    if (this.sessionLoads.has(sessionId)) return;
+    const epoch = state.configEpoch;
+    const before = state.advertisedConfig;
+    if (!await this.hydrateModelSettings(state)) return;
+    const configOptions = await this.sessionConfigOptions(state);
+    const serialized = JSON.stringify(configOptions);
+    if (this.sessions.get(sessionId) !== state || state.configEpoch !== epoch || before === serialized) return;
+    try {
+      await state.clientContext.notify(methods.client.session.update, {
+        sessionId, update: { sessionUpdate: "config_option_update", configOptions },
+      });
+      state.advertisedConfig = serialized;
+    } catch {
+      log("configuration refresh notification unavailable");
+    }
+  }
+
+  private mutateConfiguration<T>(state: AcpSessionState, mutation: () => Promise<T>): Promise<T> {
+    if (this.sessionLoads.has(state.session.conversationId!)) return Promise.reject(RequestError.invalidParams(undefined, "Cannot change configuration while the session is loading"));
+    if (state.promptActive) {
+      return Promise.reject(RequestError.invalidParams(undefined, "Cannot change configuration during an active prompt"));
+    }
+    const epoch = state.configEpoch;
+    const queued = state.configTail.then(() => {
+      if (this.sessions.get(state.session.conversationId!) !== state || state.configEpoch !== epoch) {
+        throw new Error("Session was replaced before configuration could be applied");
+      }
+      return mutation();
+    });
+    state.configTail = queued.then(() => {}, () => {});
+    return queued;
+  }
+
   async setSessionConfigOption(
+    params: SetSessionConfigOptionRequest,
+  ): Promise<SetSessionConfigOptionResponse> {
+    const state = this.sessions.get(params.sessionId);
+    if (!state) throw new Error(`Unknown session: ${params.sessionId}`);
+    return this.mutateConfiguration(state, async () => {
+      try {
+        const result = await this.applySessionConfigOption(params);
+        state.advertisedConfig = JSON.stringify(result.configOptions);
+        return result;
+      }
+      catch (error) {
+        if (params.configId === "model" || params.configId === THOUGHT_LEVEL_CONFIG_ID) {
+          // A failed acknowledgement does not prove the backend rolled back.
+          try {
+            if (state.modelCatalog) await this.publishModelRefresh(params.sessionId, state);
+            // Do not immediately retry a catalog request that just failed.
+            else await this.hydrateModelSettings(state);
+          }
+          catch { log("configuration readback after a failed update unavailable"); }
+        }
+        throw error;
+      }
+    });
+  }
+
+  private async applySessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
     const started = performance.now();
@@ -652,6 +768,7 @@ export class LettaAcpAgent {
       if (typeof params.value !== "string") {
         throw new Error("The model configuration option requires a model id");
       }
+      await this.hydrateModelSettings(state);
       const optionsStarted = performance.now();
       const configOptions = await this.sessionConfigOptions(state);
       const optionsMs = Math.round(performance.now() - optionsStarted);
@@ -659,7 +776,7 @@ export class LettaAcpAgent {
       const models = await this.sessionModels(state);
       // A handle alone cannot confirm which context-window variant is active.
       // Only suppress restoration when the selection is known, not inferred.
-      const selectionKnown = models.some((entry) => entry.id === state.currentModel) ||
+      const selectionKnown = selected?.currentValue === state.currentModel || models.some((entry) => entry.id === state.currentModel) ||
         collapseVariants(models).filter((entry) => entry.handle === state.currentModel).length === 1;
       if (
         selectionKnown &&
@@ -677,12 +794,15 @@ export class LettaAcpAgent {
       state.currentModel = models.some((entry) => entry.id === params.value)
         ? params.value
         : result.modelHandle ?? result.modelId ?? params.value;
+      state.reasoningEffort = undefined;
+      state.contextWindow = undefined;
+      state.settingsConfirmed = false;
+      await this.hydrateModelSettings(state);
       // A new model may not offer the previous tier; let the catalog decide.
       const updateMs = Math.round(performance.now() - updateStarted);
       const rebuildStarted = performance.now();
       const rebuilt = await this.sessionConfigOptions(state);
       const rebuildMs = Math.round(performance.now() - rebuildStarted);
-      state.reasoningEffort = undefined;
       log(`session ${params.sessionId} model -> ${state.currentModel}`);
       log(
         `timing: set session config ${params.configId} ${Math.round(performance.now() - started)}ms ` +
@@ -694,13 +814,24 @@ export class LettaAcpAgent {
       if (typeof params.value !== "string") {
         throw new Error("The thought level configuration option requires a tier");
       }
+      await this.hydrateModelSettings(state);
+      const options = await this.sessionConfigOptions(state);
+      const thinking = options.find((option) => option.id === THOUGHT_LEVEL_CONFIG_ID);
+      if (params.value === thinking?.currentValue) return { configOptions: options };
+      const models = await this.sessionModels(state);
+      const handle = models.find((entry) => entry.id === state.currentModel)?.handle ?? state.currentModel;
+      const matching = models.find((entry) => entry.handle === handle && entryReasoningEffort(entry) === params.value &&
+        (state.contextWindow === undefined || entry.updateArgs?.context_window === undefined || entry.updateArgs.context_window === state.contextWindow));
+      if (state.contextWindow !== undefined && !matching) throw RequestError.invalidParams(undefined, "That reasoning tier is not available for the saved context window");
       // Reasoning-only update: keeps the model and its other settings. The SDK
       // rejects tiers the target handle does not advertise.
       const levelStarted = performance.now();
       await state.session.updateModel({
+        ...(matching ? { modelId: matching.id } : {}),
         reasoningEffort: params.value as ReasoningEffort,
       });
       state.reasoningEffort = params.value;
+      await this.hydrateModelSettings(state);
       const rebuilt = await this.sessionConfigOptions(state);
       log(`session ${params.sessionId} thought level -> ${params.value}`);
       log(
@@ -723,16 +854,25 @@ export class LettaAcpAgent {
     if (!isSessionModeId(params.modeId)) {
       throw new Error(`Unknown mode: ${params.modeId}`);
     }
-    state.modeId = params.modeId;
-    log(`session ${params.sessionId} mode -> ${params.modeId}`);
-    void cx.notify(methods.client.session.update, {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "current_mode_update",
-        currentModeId: params.modeId,
-      },
+    return this.mutateConfiguration(state, async () => {
+      state.modeId = params.modeId as PermissionMode;
+      log(`session ${params.sessionId} mode -> ${params.modeId}`);
+      await cx.notify(methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "current_mode_update",
+          currentModeId: params.modeId,
+        },
+      });
+      const configOptions = await this.sessionConfigOptions(state);
+      if (this.sessions.get(params.sessionId) === state) {
+        await cx.notify(methods.client.session.update, {
+          sessionId: params.sessionId, update: { sessionUpdate: "config_option_update", configOptions },
+        });
+        state.advertisedConfig = JSON.stringify(configOptions);
+      }
+      return {};
     });
-    return {};
   }
 
   /**
@@ -765,10 +905,18 @@ export class LettaAcpAgent {
     if (existing?.promptActive) {
       throw new Error(`Cannot load session ${options.resumeId} during an active prompt`);
     }
+    if (existing && existing.runtimeConfigKey !== runtimeConfigKey) {
+      // Invalidate queued work, but drain a write already accepted by the
+      // backend before the replacement runtime reads its persisted state.
+      existing.configEpoch++;
+      await existing.configTail;
+    }
     if (existing?.runtimeConfigKey === runtimeConfigKey) {
       try {
+        await existing.configTail;
         const ready = await timed("reuse runtime", () => existing.session.ready());
         existing.clientContext = options.clientContext;
+        await this.hydrateModelSettings(existing);
         return { sessionId: ready.conversationId, state: existing };
       } catch (error) {
         log(`reopening unavailable session ${options.resumeId}: ${String(error)}`);
@@ -834,6 +982,8 @@ export class LettaAcpAgent {
       alwaysAllowed: new Set(),
       cancelled: false,
       promptActive: false,
+      configTail: Promise.resolve(),
+      configEpoch: 0,
       modeId: this.config.permissionMode,
       cwd: options.cwd,
       currentModel: bootstrap.model ?? this.config.model,
@@ -857,6 +1007,7 @@ export class LettaAcpAgent {
     }
     this.sessions.set(sessionId, state);
     state.namer = this.createNamer(sessionId, state);
+    await this.hydrateModelSettings(state);
     return { sessionId, state };
   }
 
@@ -1005,13 +1156,33 @@ export class LettaAcpAgent {
     cx: AgentContext,
   ): Promise<PromptResponse> {
     const state = this.sessions.get(params.sessionId);
-    const result = await this.runPrompt(params, cx);
-    if (result.stopReason === "end_turn" && titleMessagesFromHistory([{
-      message_type: "user_message", content: params.prompt.filter((part) => part.type === "text"),
-    }]).length > 0) {
-      if (this.sessions.get(params.sessionId) === state) state?.namer?.maybeAutoTitle();
+    if (!state) throw new Error(`Unknown session: ${params.sessionId}`);
+    if (state.promptActive) throw new Error(`Session ${params.sessionId} already has an active prompt`);
+    if (this.sessionLoads.has(params.sessionId)) throw new Error(`Cannot prompt session ${params.sessionId} while it is loading`);
+    // Reserve admission before awaiting queued configuration, preventing later
+    // mutations from overtaking this prompt.
+    state.promptActive = true;
+    state.cancelled = false;
+    state.waitingForConfiguration = true;
+    try {
+      const cancelled = new Promise<void>((resolve) => { state.cancelConfigurationWait = resolve; });
+      await Promise.race([state.configTail, cancelled]);
+      state.waitingForConfiguration = false;
+      if (this.sessions.get(params.sessionId) !== state) throw new Error("Session was replaced before the prompt could start");
+      if (state.cancelled) return { stopReason: "cancelled" };
+      const result = await this.runPrompt(params, cx);
+      if (result.stopReason === "end_turn" && titleMessagesFromHistory([{
+        message_type: "user_message", content: params.prompt.filter((part) => part.type === "text"),
+      }]).length > 0 && this.sessions.get(params.sessionId) === state) {
+        state.namer?.maybeAutoTitle();
+      }
+      return result;
+    } finally {
+      state.cancelConfigurationWait = undefined;
+      state.waitingForConfiguration = false;
+      state.promptActive = false;
+      this.scheduleModelRefresh(params.sessionId, state);
     }
-    return result;
   }
 
   private async runPrompt(
@@ -1025,7 +1196,6 @@ export class LettaAcpAgent {
     if (this.sessionLoads.has(params.sessionId)) {
       throw new Error(`Cannot prompt session ${params.sessionId} while it is loading`);
     }
-    if (state.promptActive) throw new Error(`Session ${params.sessionId} already has an active prompt`);
     const reader = this.startReader(params.sessionId, state);
     const events = reader.observe();
     state.promptEvents = events;
@@ -1167,8 +1337,7 @@ export class LettaAcpAgent {
     } finally {
       reader.release(events);
       state.promptEvents = null;
-      // Delivery outlives this observer; late permissions use a finite deadline.
-      state.promptActive = false;
+      // Admission belongs to prompt(); delivery outlives this stream observer.
     }
   }
 
@@ -1252,6 +1421,9 @@ export class LettaAcpAgent {
       } else {
         const result = await state.session.updateModel(argument);
         state.currentModel = result.modelHandle ?? result.modelId ?? argument;
+        state.reasoningEffort = undefined;
+        state.contextWindow = undefined;
+        state.settingsConfirmed = false;
         await reply(`Model switched to \`${state.currentModel}\`.`);
       }
     } catch (error) {
@@ -1470,6 +1642,10 @@ export class LettaAcpAgent {
     state.cancelled = true;
     state.namer?.cancel();
     // No turn was sent yet; aborting here would create an orphaned SDK result.
+    if (state.waitingForConfiguration) {
+      state.cancelConfigurationWait?.();
+      return;
+    }
     if (state.waitingForCommandDiscovery || state.adapterCommandActive) return;
     // Interrupted tool calls never produce a tool_result, so drop their
     // accumulated arguments here instead of leaking them for the session.
