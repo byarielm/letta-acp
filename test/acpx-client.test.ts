@@ -28,6 +28,7 @@ function startFakeAppServer(
   unconfirmedFirst = false,
 ) {
   let replyCount = 0;
+  let reloaded = false;
   const server = Bun.serve<{ channel: "control" | "stream" }>({
     hostname: "127.0.0.1",
     port: 0,
@@ -42,6 +43,17 @@ function startFakeAppServer(
       message(socket, data) {
         const message = JSON.parse(String(data)) as WireMessage;
         if (socket.data.channel !== "control") return;
+        const sendStatus = () => socket.send(JSON.stringify({
+          type: "update_device_status", runtime: TEST_RUNTIME,
+          device_status: { is_online: true, is_processing: false,
+            current_permission_mode: "standard", current_working_directory: "/server/project",
+            supported_commands: ["reflect", "reload"],
+            mod_commands: [{ id: reloaded ? "after-reload" : "project-status",
+              description: "Runtime mod command", args: "<scope>" }],
+            current_available_skills: [
+              { name: "server-only-skill", description: "Agent skill on the runtime", source: "agent" },
+            ] },
+        }));
 
         switch (message.type) {
           case "runtime_start": {
@@ -62,11 +74,7 @@ function startFakeAppServer(
           case "sync":
             socket.send(JSON.stringify({ type: "sync_response", request_id: message.request_id,
               success: true, runtime: TEST_RUNTIME }));
-            socket.send(JSON.stringify({ type: "update_device_status", runtime: TEST_RUNTIME,
-              device_status: { is_online: true, is_processing: false,
-                current_permission_mode: "standard", current_working_directory: "/server/project", current_available_skills: [
-                  { name: "server-only-skill", description: "Agent skill on the runtime", source: "agent" },
-                ] } }));
+            sendStatus();
             return;
           case "conversation_retrieve":
             socket.send(JSON.stringify({
@@ -112,14 +120,27 @@ function startFakeAppServer(
             }));
             return;
           case "execute_command": {
-            expect(message.command_id).toBe("reflect");
-            expect(message.args).toBe("--instruction Remember architecture decisions");
-            sendDelta(socket, { message_type: "slash_command_start", command_id: "reflect" });
+            const command = message.command_id;
+            let output: string;
+            if (command === "reflect") {
+              expect(message.args).toBe("--instruction Remember architecture decisions");
+              output = "Started a reflection pass for this conversation.";
+            } else if (command === "project-status") {
+              expect(message.args).toBe("src");
+              output = "PROJECT_STATUS_OK";
+            } else if (command === "reload") {
+              reloaded = true;
+              sendStatus();
+              output = "Reloaded settings";
+            } else {
+              throw new Error(`Unexpected execute command: ${String(command)}`);
+            }
+            sendDelta(socket, { message_type: "slash_command_start", command_id: command });
             sendDelta(socket, {
               message_type: "slash_command_end",
-              command_id: "reflect",
+              command_id: command,
               success: true,
-              output: "Started a reflection pass for this conversation.",
+              output,
             });
             return;
           }
@@ -435,6 +456,7 @@ describe("acpx client compatibility", () => {
     let sessionId = "";
     let commandsReceived = false;
     let runtimeSkillsReceived = false;
+    let runtimeCommandsReloaded = false;
     let buffer = "";
     const decoder = new TextDecoder();
     try {
@@ -453,11 +475,16 @@ describe("acpx client compatibility", () => {
             expect(message.params.update.availableCommands).toContainEqual({
               name: "reflect",
               description: "Start a manual reflection pass on the current conversation",
-              input: { hint: "--instruction <focus> (optional)" },
             });
             commandsReceived = true;
             if (message.params.update.availableCommands.some((c: { name: string }) => c.name === "server-only-skill")) {
               runtimeSkillsReceived = true;
+            }
+            const names = message.params.update.availableCommands.map((c: { name: string }) => c.name);
+            if (names.includes("after-reload")) {
+              expect(names).not.toContain("project-status");
+              expect(names).not.toContain("clear");
+              runtimeCommandsReloaded = true;
             }
           }
           if (message.params?.update?.content?.text === "ACPX_OK") replies += 1;
@@ -485,6 +512,11 @@ describe("acpx client compatibility", () => {
             expect(commandsReceived).toBe(true);
             expect(runtimeSkillsReceived).toBe(true);
             replacementCompleted = true;
+            send(5, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/reload" }] });
+          }
+          if (message.id === 5) {
+            expect(message.result.stopReason).toBe("end_turn");
+            expect(runtimeCommandsReloaded).toBe(true);
             break outer;
           }
         }
@@ -511,6 +543,12 @@ describe("acpx client compatibility", () => {
       "exec", "/reflect --instruction Remember architecture decisions",
     ]);
     expect(stdout.trim()).toBe("Started a reflection pass for this conversation.");
+  }, acpxTestTimeoutMs);
+
+  test("executes a runtime-advertised mod command through a real ACP client", async () => {
+    // Even an immediate prompt on a fresh session must wait for discovery.
+    const { stdout } = await runAcpx("quiet", ["exec", "/project-status src"]);
+    expect(stdout.trim()).toBe("PROJECT_STATUS_OK");
   }, acpxTestTimeoutMs);
 
   test("a real ACP client waits past an unconfirmed synthetic completion", async () => {

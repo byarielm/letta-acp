@@ -70,7 +70,9 @@ import {
 import {
   buildAvailableCommands,
   isExecuteCommand,
+  runtimeCommands,
   runtimeSkills,
+  type RuntimeCommands,
   type SkillEntry,
 } from "./slash-commands.js";
 import {
@@ -122,7 +124,11 @@ interface AcpSessionState {
   reader: SessionReader | null;
   promptEvents: PromptEvents | null;
   skills: SkillEntry[];
+  runtimeCommands: RuntimeCommands;
+  knownModCommands: Set<string>;
   stopCommandUpdates?: () => void;
+  commandDiscovery?: Promise<void>;
+  waitingForCommandDiscovery?: boolean;
   commandsActive?: boolean;
   lastCommands?: string;
   /** Cached model catalog, shared by every config request in its TTL window. */
@@ -788,6 +794,8 @@ export class LettaAcpAgent {
       reader: null,
       promptEvents: null,
       skills: [],
+      runtimeCommands: { mods: [] },
+      knownModCommands: new Set(),
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -823,18 +831,21 @@ export class LettaAcpAgent {
         if (this.sessions.get(sessionId) !== state || !state.commandsActive) return;
         const skills = runtimeSkills(status.raw);
         if (skills !== undefined) state.skills = skills;
+        state.runtimeCommands = runtimeCommands(status.raw, state.runtimeCommands);
+        for (const command of state.runtimeCommands.mods) state.knownModCommands.add(command.name);
         this.publishCommands(sessionId, state);
       });
       // Discovery must not hold up session creation or require a model turn.
-      void state.session.getDeviceStatus({ timeoutMs: 1_500 }).catch((error) => {
-        log(`runtime command discovery unavailable for ${sessionId}: ${String(error)}`);
-      });
+      state.commandDiscovery = state.session.getDeviceStatus({ timeoutMs: 1_500 }).then(
+        () => {},
+        (error) => log(`runtime command discovery unavailable for ${sessionId}: ${String(error)}`),
+      );
     }
     this.publishCommands(sessionId, state, cx);
   }
 
   private publishCommands(sessionId: string, state: AcpSessionState, cx = state.clientContext): void {
-    const availableCommands = buildAvailableCommands(state.skills);
+    const availableCommands = buildAvailableCommands(state.skills, state.runtimeCommands);
     const serialized = JSON.stringify(availableCommands);
     if (state.lastCommands === serialized) return;
     state.lastCommands = serialized;
@@ -871,6 +882,16 @@ export class LettaAcpAgent {
     state.promptActive = true;
 
     try {
+      const first = params.prompt[0];
+      if (params.prompt.length === 1 && first?.type === "text" && first.text.trimStart().startsWith("/")) {
+        // A client can submit a custom command immediately after session/new,
+        // before the deferred menu announcement and initial status round-trip.
+        if (!state.stopCommandUpdates) this.announceCommands(params.sessionId, cx);
+        state.waitingForCommandDiscovery = true;
+        await state.commandDiscovery;
+        state.waitingForCommandDiscovery = false;
+        if (state.cancelled) return { stopReason: "cancelled" };
+      }
       const commandResponse = await this.maybeRunCommand(params, state, cx);
       if (commandResponse) return commandResponse;
       await state.session.send(toLettaContent(params.prompt));
@@ -1017,10 +1038,21 @@ export class LettaAcpAgent {
     const command = (match[1] ?? "").toLowerCase();
     const argument = match[2]?.trim();
 
-    if (isExecuteCommand(command)) {
+    if (isExecuteCommand(command, state.runtimeCommands)) {
       return this.runExecuteCommand(params.sessionId, state, cx, command, argument);
     }
-    if (command !== "model") return null;
+    if (command !== "model") {
+      if (!isExecuteCommand(command) && !state.knownModCommands.has(command)) return null;
+      // A removed or unsupported executable must not silently become a model prompt.
+      await cx.notify(methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `/${command} is not available on the current runtime.` },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
 
     const reply = async (text: string) => {
       await cx.notify(methods.client.session.update, {
@@ -1265,6 +1297,8 @@ export class LettaAcpAgent {
     const state = this.sessions.get(params.sessionId);
     if (!state) return;
     state.cancelled = true;
+    // No turn was sent yet; aborting here would create an orphaned SDK result.
+    if (state.waitingForCommandDiscovery) return;
     // Interrupted tool calls never produce a tool_result, so drop their
     // accumulated arguments here instead of leaking them for the session.
     state.toolCalls.clear();

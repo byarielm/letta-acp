@@ -32,6 +32,10 @@ class FakeAppServer {
   readonly providerRequests: WireMessage[] = [];
   readonly commandRequests: WireMessage[] = [];
   deviceStatus: WireMessage = { current_available_skills: [] };
+  commandOutputs: Record<string, string> = {};
+  reloadDeviceStatus?: WireMessage;
+  statusGate?: Promise<void>;
+  statusUnavailable = false;
   private statusTargets = new Map<string, { socket: ServerSocket; runtime: RuntimeScope }>();
 
   sendDeviceStatus(raw: WireMessage, conversationId = "conv-test-1"): void {
@@ -391,8 +395,17 @@ class FakeAppServer {
       case "sync": {
         const runtime = message.runtime as RuntimeScope;
         this.statusTargets.set(runtime.conversation_id, { socket, runtime });
+        if (this.statusUnavailable) {
+          socket.push({ type: "sync_response", request_id: message.request_id,
+            success: false, error: "Sync is not supported", runtime });
+          return;
+        }
         socket.push({ type: "sync_response", request_id: message.request_id, success: true, runtime });
-        this.sendDeviceStatus(this.deviceStatus, runtime.conversation_id);
+        if (this.statusGate) {
+          void this.statusGate.then(() => this.sendDeviceStatus(this.deviceStatus, runtime.conversation_id));
+        } else {
+          this.sendDeviceStatus(this.deviceStatus, runtime.conversation_id);
+        }
         return;
       }
       case "execute_command":
@@ -670,12 +683,16 @@ class FakeAppServer {
       message_type: "slash_command_start",
       command_id: command,
     });
-    if (command === "reflect") {
+    if (command === "reload" && this.reloadDeviceStatus) {
+      this.deviceStatus = this.reloadDeviceStatus;
+      this.sendDeviceStatus(this.deviceStatus, runtime.conversation_id);
+    }
+    if (command === "reflect" || command in this.commandOutputs) {
       this.pushDelta(socket, runtime, {
         message_type: "slash_command_end",
         command_id: command,
         success: true,
-        output: "Started a reflection pass for this conversation.",
+        output: this.commandOutputs[command] ?? "Started a reflection pass for this conversation.",
       });
       this.activeCommand = null;
       return;
@@ -903,6 +920,112 @@ async function openSession(
 }
 
 describe("Agent SDK app-server integration", () => {
+  test("cancels discovery before dispatch without leaving an interrupted result", async () => {
+    const server = new FakeAppServer();
+    let release!: () => void;
+    server.statusGate = new Promise<void>((resolve) => { release = resolve; });
+    server.deviceStatus = { supported_commands: [], mod_commands: [
+      { id: "project-status", description: "Project status" },
+    ] };
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const pending = agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "/project-status" }] }, context);
+      await Bun.sleep(10);
+      await agent.cancel({ sessionId: session.sessionId });
+      release();
+      expect(await pending).toEqual({ stopReason: "cancelled" });
+      expect(server.commandRequests).toHaveLength(0);
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "plain prompt" }] }, context)).toEqual({ stopReason: "end_turn" });
+      expect(updates).toContainEqual({ sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROMPT_OK" } });
+    } finally { release(); agent.shutdown(); }
+  });
+
+  test("keeps legacy commands usable when runtime discovery is unavailable", async () => {
+    const server = new FakeAppServer();
+    server.statusUnavailable = true;
+    const agent = createAgent(server);
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "/reflect" }] }, context)).toEqual({ stopReason: "end_turn" });
+      expect(server.commandRequests[0]?.command_id).toBe("reflect");
+    } finally { agent.shutdown(); }
+  });
+
+  test("dispatches runtime mod commands and refreshes capabilities after /reload", async () => {
+    const server = new FakeAppServer();
+    server.deviceStatus = { supported_commands: ["reload", "reflect"],
+      mod_commands: [{ id: "project-status", description: "Inspect project", args: "<scope>" }],
+      current_available_skills: [{ name: "project-status", description: "A colliding skill" }],
+    };
+    server.commandOutputs = { "project-status": "PROJECT_STATUS_OK", reload: "Reloaded settings" };
+    server.reloadDeviceStatus = { supported_commands: ["reload"],
+      mod_commands: [{ id: "new-command", description: "Registered after reload" }],
+      current_available_skills: [],
+    };
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    const prompt = (sessionId: string, text: string) => agent.prompt({ sessionId,
+      prompt: [{ type: "text", text }] }, context);
+    const latest = () => updates.filter((u) => u.sessionUpdate === "available_commands_update")
+      .at(-1)?.availableCommands as Array<{ name: string; input?: { hint: string } }>;
+    try {
+      const session = await openSession(agent, context);
+      await Bun.sleep(10);
+      expect(latest().find((c) => c.name === "project-status")?.input?.hint).toBe("<scope>");
+      expect(latest().some((c) => c.name === "clear")).toBe(false);
+      expect(await prompt(session.sessionId, "/project-status src")).toEqual({ stopReason: "end_turn" });
+      expect(server.commandRequests[0]).toMatchObject({ command_id: "project-status", args: "src" });
+      expect(updates).toContainEqual({ sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROJECT_STATUS_OK" } });
+      await prompt(session.sessionId, "/remember not supported here");
+      expect(server.commandRequests).toHaveLength(1);
+      expect(updates).toContainEqual({ sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "/remember is not available on the current runtime." } });
+      await prompt(session.sessionId, "/reload");
+      expect(latest().some((c) => c.name === "project-status")).toBe(false);
+      expect(latest().some((c) => c.name === "reflect")).toBe(false);
+      expect(latest().some((c) => c.name === "new-command")).toBe(true);
+      await prompt(session.sessionId, "/project-status");
+      await prompt(session.sessionId, "/reflect");
+      expect(server.commandRequests).toHaveLength(2);
+      expect(updates).toContainEqual({ sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "/project-status is not available on the current runtime." } });
+      // Unknown slash names still reach the model, allowing ordinary skill invocation.
+      expect(await prompt(session.sessionId, "/unadvertised-skill")).toEqual({ stopReason: "end_turn" });
+      expect(updates).toContainEqual({ sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROMPT_OK" } });
+    } finally { agent.shutdown(); }
+  });
+
+  test("isolates runtime command inventories between concurrent sessions", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const first = createContext();
+    const second = createContext();
+    try {
+      const a = await openSession(agent, first.context);
+      const b = await agent.newSession({ cwd: "/tmp/other-project", mcpServers: [] }, second.context);
+      await Bun.sleep(10);
+      server.sendDeviceStatus({ supported_commands: ["reflect"],
+        mod_commands: [{ id: "only-first", description: "First session" }] }, a.sessionId);
+      await Bun.sleep(10);
+      const menu = (updates: WireMessage[]) => JSON.stringify(updates.filter((u) =>
+        u.sessionUpdate === "available_commands_update").at(-1));
+      expect(menu(first.updates)).toContain("only-first");
+      expect(menu(second.updates)).not.toContain("only-first");
+      expect(await agent.prompt({ sessionId: b.sessionId,
+        prompt: [{ type: "text", text: "/only-first" }] }, second.context)).toEqual({ stopReason: "end_turn" });
+      expect(server.commandRequests).toHaveLength(0);
+    } finally { agent.shutdown(); }
+  });
+
   test("advertises scoped runtime skills and refreshes without another prompt", async () => {
     const server = new FakeAppServer();
     server.deviceStatus = { current_available_skills: [

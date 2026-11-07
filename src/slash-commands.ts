@@ -36,7 +36,8 @@ export const EXECUTE_COMMANDS: ExecuteCommandSpec[] = [
   {
     name: "reflect",
     description: "Start a manual reflection pass on the current conversation",
-    hint: "--instruction <focus> (optional)",
+    // No argument-capability metadata is exposed. Cloud-owned reflection
+    // rejects arguments, so only advertise the universally supported form.
   },
   {
     name: "context-limit",
@@ -65,12 +66,53 @@ const TEXT_COMMANDS: ExecuteCommandSpec[] = [
 
 const EXECUTE_COMMAND_NAMES = new Set(EXECUTE_COMMANDS.map((c) => c.name));
 
-export function isExecuteCommand(name: string): boolean {
-  return EXECUTE_COMMAND_NAMES.has(name);
+export interface RuntimeCommands {
+  /** Undefined means the older runtime did not report a supported-command list. */
+  supported?: ReadonlySet<string>;
+  mods: ExecuteCommandSpec[];
+}
+
+function executeCommands(runtime?: RuntimeCommands): ExecuteCommandSpec[] {
+  const builtins = EXECUTE_COMMANDS.filter((spec) =>
+    !runtime?.supported || runtime.supported.has(spec.name));
+  // The harness routes built-ins before mod commands; /model belongs to ACP.
+  const mods = runtime?.mods.filter((spec) =>
+    spec.name !== "model" && !EXECUTE_COMMAND_NAMES.has(spec.name)) ?? [];
+  return [...builtins, ...mods];
+}
+
+export function isExecuteCommand(name: string, runtime?: RuntimeCommands): boolean {
+  return executeCommands(runtime).some((spec) => spec.name === name);
+}
+
+/** Device status is a snapshot: an omitted mod list means no registered mods. */
+export function runtimeCommands(raw: Record<string, unknown>, previous?: RuntimeCommands): RuntimeCommands {
+  const supported = Array.isArray(raw.supported_commands)
+    ? new Set(raw.supported_commands.filter((name): name is string =>
+      typeof name === "string" && /^[a-z0-9][a-z0-9-]*$/.test(name)))
+    : previous?.supported;
+  const mods = new Map<string, ExecuteCommandSpec>();
+  if (Array.isArray(raw.mod_commands)) {
+    for (const value of raw.mod_commands) {
+      if (!value || typeof value !== "object") continue;
+      const command = value as Record<string, unknown>;
+      if (typeof command.id !== "string" || !/^[a-z0-9][a-z0-9-]*$/.test(command.id)) continue;
+      if (command.id === "model" || EXECUTE_COMMAND_NAMES.has(command.id) || mods.has(command.id)) continue;
+      const description = typeof command.description === "string" && command.description.trim()
+        ? command.description.trim() : `Run /${command.id}`;
+      mods.set(command.id, {
+        name: command.id,
+        description: description.slice(0, 160),
+        ...(typeof command.args === "string" && command.args.trim()
+          ? { hint: command.args.trim().slice(0, 160) } : {}),
+      });
+    }
+  }
+  return { supported, mods: [...mods.values()].sort((a, b) => a.name.localeCompare(b.name)) };
 }
 
 /** Full command list, using the executing harness's scoped skill inventory. */
-export function buildAvailableCommands(skills: readonly SkillEntry[] = []): AvailableCommand[] {
+export function buildAvailableCommands(skills: readonly SkillEntry[] = [], runtime?: RuntimeCommands): AvailableCommand[] {
   const commands: AvailableCommand[] = [
     {
       name: "model",
@@ -78,16 +120,18 @@ export function buildAvailableCommands(skills: readonly SkillEntry[] = []): Avai
       input: { hint: "model handle (leave empty to list)" },
     },
   ];
-  for (const spec of [...EXECUTE_COMMANDS, ...TEXT_COMMANDS]) {
+  const seen = new Set(commands.map((c) => c.name));
+  for (const spec of [...executeCommands(runtime), ...TEXT_COMMANDS]) {
+    if (seen.has(spec.name)) continue;
+    seen.add(spec.name);
     commands.push({
       name: spec.name,
       description: spec.description,
       ...(spec.hint ? { input: { hint: spec.hint } } : {}),
     });
   }
-  const seen = new Set(commands.map((c) => c.name));
   for (const skill of skills) {
-    if (seen.has(skill.name)) continue;
+    if (seen.has(skill.name) || EXECUTE_COMMAND_NAMES.has(skill.name)) continue;
     seen.add(skill.name);
     commands.push({
       name: skill.name,
