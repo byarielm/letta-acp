@@ -69,6 +69,18 @@ describe("thought level options", () => {
     });
   });
 
+  test("keeps unknown selection explicit instead of choosing the first tier", () => {
+    const option = thoughtLevelConfigOption(reasoning as any, "openai/gpt-6-astra", undefined);
+    expect(option).toMatchObject({ currentValue: "unconfirmed" });
+    expect(option?.type === "select" ? option.options[0] : undefined).toEqual({ value: "unconfirmed", name: "Unconfirmed" });
+  });
+
+  test("preserves a persisted tier that is absent from the current catalog", () => {
+    const option = thoughtLevelConfigOption(reasoning as any, "openai/gpt-6-astra", "vendor-tier");
+    expect(option).toMatchObject({ currentValue: "vendor-tier" });
+    expect(option?.type === "select" ? option.options[0] : undefined).toEqual({ value: "vendor-tier", name: "vendor-tier" });
+  });
+
   test("returns null for a non-reasoning model", () => {
     expect(
       thoughtLevelConfigOption(reasoning as any, "letta/auto", undefined),

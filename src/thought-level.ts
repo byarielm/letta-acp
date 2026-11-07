@@ -71,8 +71,18 @@ export function thoughtLevelConfigOption(
   current: string | undefined,
 ): SessionConfigOption | null {
   const tiers = reasoningTiers(entries, handle);
-  if (tiers.length < 2) return null;
-  const currentValue = current && tiers.includes(current) ? current : tiers[0];
+  const knownCurrent = current !== undefined && tiers.includes(current);
+  if (tiers.length < 2 && (current === undefined || knownCurrent)) return null;
+  const currentValue = current ?? "unconfirmed";
+  const options = [
+    ...(!knownCurrent
+      ? [{ value: currentValue, name: current === undefined ? "Unconfirmed" : current }]
+      : []),
+    ...tiers.map((effort) => ({
+      value: effort,
+      name: EFFORT_LABELS[effort] ?? effort,
+    })),
+  ];
   return {
     id: THOUGHT_LEVEL_CONFIG_ID,
     name: "Thinking",
@@ -80,9 +90,6 @@ export function thoughtLevelConfigOption(
     category: "thought_level",
     type: "select",
     currentValue,
-    options: tiers.map((effort) => ({
-      value: effort,
-      name: EFFORT_LABELS[effort] ?? effort,
-    })),
+    options,
   };
 }
