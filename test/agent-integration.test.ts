@@ -31,6 +31,18 @@ class FakeAppServer {
   readonly modelRequests: WireMessage[] = [];
   readonly providerRequests: WireMessage[] = [];
   readonly commandRequests: WireMessage[] = [];
+  deviceStatus: WireMessage = { current_available_skills: [] };
+  private statusTargets = new Map<string, { socket: ServerSocket; runtime: RuntimeScope }>();
+
+  sendDeviceStatus(raw: WireMessage, conversationId = "conv-test-1"): void {
+    const target = this.statusTargets.get(conversationId);
+    if (!target) throw new Error("No device status subscriber");
+    target.socket.push({
+      type: "update_device_status", runtime: target.runtime,
+      device_status: { is_online: true, is_processing: false,
+        current_permission_mode: "standard", current_working_directory: "/server/project", ...raw },
+    });
+  }
   modelFailuresRemaining = 0;
   modelEntries: LettaCodeModelEntry[] = [
     {
@@ -376,6 +388,13 @@ class FakeAppServer {
       case "input":
         this.handleInput(socket, message);
         return;
+      case "sync": {
+        const runtime = message.runtime as RuntimeScope;
+        this.statusTargets.set(runtime.conversation_id, { socket, runtime });
+        socket.push({ type: "sync_response", request_id: message.request_id, success: true, runtime });
+        this.sendDeviceStatus(this.deviceStatus, runtime.conversation_id);
+        return;
+      }
       case "execute_command":
         this.handleCommand(socket, message);
         return;
@@ -884,6 +903,48 @@ async function openSession(
 }
 
 describe("Agent SDK app-server integration", () => {
+  test("advertises scoped runtime skills and refreshes without another prompt", async () => {
+    const server = new FakeAppServer();
+    server.deviceStatus = { current_available_skills: [
+      { name: "remote-agent-skill", description: "Lives on the server", source: "agent" },
+      { name: "remote-project-skill", description: "Project override", source: "project" },
+    ] };
+    const agent = createAgent(server);
+    const first = createContext();
+    const second = createContext();
+    const menus = (updates: WireMessage[]) => updates.filter((u) =>
+      u.sessionUpdate === "available_commands_update");
+    const names = (updates: WireMessage[]) =>
+      (menus(updates).at(-1)?.availableCommands as Array<{ name: string }> ?? []).map((c) => c.name);
+    try {
+      const session = await openSession(agent, first.context);
+      await Bun.sleep(10);
+      expect(names(first.updates)).toContain("remote-agent-skill");
+      expect(names(first.updates)).toContain("remote-project-skill");
+      const count = menus(first.updates).length;
+      server.sendDeviceStatus(server.deviceStatus);
+      await Bun.sleep(10);
+      expect(menus(first.updates)).toHaveLength(count);
+      server.sendDeviceStatus({ current_available_skills: [] });
+      await Bun.sleep(10);
+      expect(names(first.updates)).not.toContain("remote-agent-skill");
+      await agent.loadSession({ sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, second.context);
+      expect(menus(second.updates).length).toBeGreaterThan(0);
+      const firstCount = menus(first.updates).length;
+      server.sendDeviceStatus({ current_available_skills: [
+        { name: "after-reload", description: "New inventory" },
+      ] });
+      await Bun.sleep(10);
+      expect(names(second.updates)).toContain("after-reload");
+      expect(menus(first.updates)).toHaveLength(firstCount);
+      agent.shutdown();
+      const secondCount = menus(second.updates).length;
+      server.sendDeviceStatus(server.deviceStatus);
+      await Bun.sleep(10);
+      expect(menus(second.updates)).toHaveLength(secondCount);
+    } finally { agent.shutdown(); }
+  });
+
   test("delivers background output after prompt completion without another prompt", async () => {
     const server = new FakeAppServer();
     const agent = createAgent(server);

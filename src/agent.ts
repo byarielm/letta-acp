@@ -70,6 +70,8 @@ import {
 import {
   buildAvailableCommands,
   isExecuteCommand,
+  runtimeSkills,
+  type SkillEntry,
 } from "./slash-commands.js";
 import {
   accumulateToolInput,
@@ -109,7 +111,7 @@ interface AcpSessionState {
   promptActive: boolean;
   /** ACP session mode; enforced adapter-side in the permission callback. */
   modeId: PermissionMode;
-  /** Session working directory (for project skill discovery). */
+  /** Session working directory. */
   cwd: string;
   /** Runtime model handle, or selected catalog id (preserves context variants). */
   currentModel: string | undefined;
@@ -119,6 +121,10 @@ interface AcpSessionState {
   runtimeConfigKey: string;
   reader: SessionReader | null;
   promptEvents: PromptEvents | null;
+  skills: SkillEntry[];
+  stopCommandUpdates?: () => void;
+  commandsActive?: boolean;
+  lastCommands?: string;
   /** Cached model catalog, shared by every config request in its TTL window. */
   modelCatalog?: {
     expiresAt: number;
@@ -262,7 +268,7 @@ export class LettaAcpAgent {
     // next event-loop turn so Zed registers the id before receiving commands.
     const announcement = setImmediate(() => {
       this.commandAnnouncements.delete(announcement);
-      if (this.sessions.has(sessionId)) this.announceCommands(sessionId, cx);
+      if (this.sessions.get(sessionId) === state) this.announceCommands(sessionId, state.clientContext);
     });
     this.commandAnnouncements.add(announcement);
     return {
@@ -714,6 +720,7 @@ export class LettaAcpAgent {
       } catch (error) {
         log(`reopening unavailable session ${options.resumeId}: ${String(error)}`);
         existing.reader?.stop();
+        existing.stopCommandUpdates?.();
         existing.session.close();
       }
     }
@@ -780,6 +787,7 @@ export class LettaAcpAgent {
       runtimeConfigKey,
       reader: null,
       promptEvents: null,
+      skills: [],
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -787,6 +795,7 @@ export class LettaAcpAgent {
     const displaced = this.sessions.get(sessionId);
     if (displaced && displaced.session !== session) {
       displaced.reader?.stop();
+      displaced.stopCommandUpdates?.();
       displaced.session.close();
     }
     this.sessions.set(sessionId, state);
@@ -804,8 +813,31 @@ export class LettaAcpAgent {
   }
 
   private announceCommands(sessionId: string, cx: AgentContext): void {
-    const cwd = this.sessions.get(sessionId)?.cwd ?? process.cwd();
-    const availableCommands = buildAvailableCommands(cwd);
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.commandsActive = true;
+    // A newly attached ACP context needs the menu even when nothing changed.
+    state.lastCommands = undefined;
+    if (!state.stopCommandUpdates) {
+      state.stopCommandUpdates = state.session.onDeviceStatus((status) => {
+        if (this.sessions.get(sessionId) !== state || !state.commandsActive) return;
+        const skills = runtimeSkills(status.raw);
+        if (skills !== undefined) state.skills = skills;
+        this.publishCommands(sessionId, state);
+      });
+      // Discovery must not hold up session creation or require a model turn.
+      void state.session.getDeviceStatus({ timeoutMs: 1_500 }).catch((error) => {
+        log(`runtime command discovery unavailable for ${sessionId}: ${String(error)}`);
+      });
+    }
+    this.publishCommands(sessionId, state, cx);
+  }
+
+  private publishCommands(sessionId: string, state: AcpSessionState, cx = state.clientContext): void {
+    const availableCommands = buildAvailableCommands(state.skills);
+    const serialized = JSON.stringify(availableCommands);
+    if (state.lastCommands === serialized) return;
+    state.lastCommands = serialized;
     log(`advertising ${availableCommands.length} slash commands`);
     void cx.notify(methods.client.session.update, {
       sessionId,
@@ -813,7 +845,10 @@ export class LettaAcpAgent {
         sessionUpdate: "available_commands_update",
         availableCommands,
       },
-    }).catch((error) => log(`command announcement failed for ${sessionId}: ${String(error)}`));
+    }).catch((error) => {
+      if (state.lastCommands === serialized) state.lastCommands = undefined;
+      log(`command announcement failed for ${sessionId}: ${String(error)}`);
+    });
   }
 
   async prompt(
@@ -1246,6 +1281,7 @@ export class LettaAcpAgent {
     for (const state of this.sessions.values()) {
       try {
         state.reader?.stop();
+        state.stopCommandUpdates?.();
         state.session.close();
       } catch {
         // best-effort cleanup on connection close

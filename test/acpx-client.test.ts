@@ -59,6 +59,15 @@ function startFakeAppServer(
             }));
             return;
           }
+          case "sync":
+            socket.send(JSON.stringify({ type: "sync_response", request_id: message.request_id,
+              success: true, runtime: TEST_RUNTIME }));
+            socket.send(JSON.stringify({ type: "update_device_status", runtime: TEST_RUNTIME,
+              device_status: { is_online: true, is_processing: false,
+                current_permission_mode: "standard", current_working_directory: "/server/project", current_available_skills: [
+                  { name: "server-only-skill", description: "Agent skill on the runtime", source: "agent" },
+                ] } }));
+            return;
           case "conversation_retrieve":
             socket.send(JSON.stringify({
               type: "conversation_retrieve_response",
@@ -425,6 +434,7 @@ describe("acpx client compatibility", () => {
     let replies = 0;
     let sessionId = "";
     let commandsReceived = false;
+    let runtimeSkillsReceived = false;
     let buffer = "";
     const decoder = new TextDecoder();
     try {
@@ -446,6 +456,9 @@ describe("acpx client compatibility", () => {
               input: { hint: "--instruction <focus> (optional)" },
             });
             commandsReceived = true;
+            if (message.params.update.availableCommands.some((c: { name: string }) => c.name === "server-only-skill")) {
+              runtimeSkillsReceived = true;
+            }
           }
           if (message.params?.update?.content?.text === "ACPX_OK") replies += 1;
           if (message.id === 1) send(2, "session/new", { cwd: home, mcpServers: [] });
@@ -470,6 +483,7 @@ describe("acpx client compatibility", () => {
             expect(message.result.stopReason).toBe("end_turn");
             expect(replies).toBe(2);
             expect(commandsReceived).toBe(true);
+            expect(runtimeSkillsReceived).toBe(true);
             replacementCompleted = true;
             break outer;
           }

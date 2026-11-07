@@ -186,7 +186,7 @@ The adapter advertises the [Letta slash commands](https://docs.letta.com/platfor
 
 - **Adapter-native**: `/model`.
 - **Harness-executed** (via the app-server `execute_command` protocol): `/clear`, `/compact`, `/init`, `/doctor`, `/remember`, `/reflect`, `/context-limit`, `/reload`, `/toolset`. Commands that run a full agent turn (`/init`, `/remember`, `/doctor`) stream their tool calls and output like any prompt.
-- **Model-interpreted**: `/memory`, `/search`, `/skills`, `/skill-creator`, plus every skill discovered on disk (bundled with letta-code, `~/.letta/skills`, and the session cwd's `.claude/skills`) — these forward as prompt text, which the harness instructs the model to treat as a skill invocation.
+- **Model-interpreted**: `/memory`, `/search`, `/skills`, `/skill-creator`, plus invokable skills reported by the executing harness — these forward as prompt text, which the harness instructs the model to treat as a skill invocation. The menu follows the runtime's effective bundled, global, agent-owned, and project skill inventory, including its source restrictions and override precedence. Remote sessions use the server's inventory, never the adapter host's filesystem. Status updates refresh the menu without another prompt. Current harnesses populate the inventory during turn setup, so skills may first appear after the first turn. If an older runtime cannot report skills, the adapter advertises only its base commands rather than guessing from local files.
 
 The rest of the CLI's commands (`/agents`, `/resume`, `/login`, `/statusline`, `/exit`, …) are TUI dialogs or local-process controls with no protocol equivalent; use the editor's own UI for those (new thread ≈ `/new`, thread history ≈ `/resume`).
 

@@ -1,7 +1,3 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
 
 /**
@@ -13,7 +9,7 @@ import type { AvailableCommand } from "@agentclientprotocol/sdk";
  *   `execute_command` (results stream back as slash_command_start/end)
  * - text: forwarded to the model as prompt text; the harness instructs the
  *   model that `/name` means "invoke that skill/behavior", which also covers
- *   every skill discovered on disk
+ *   every skill reported by the executing harness
  */
 
 export interface ExecuteCommandSpec {
@@ -73,8 +69,8 @@ export function isExecuteCommand(name: string): boolean {
   return EXECUTE_COMMAND_NAMES.has(name);
 }
 
-/** Full command list to advertise for a session rooted at `cwd`. */
-export function buildAvailableCommands(cwd: string): AvailableCommand[] {
+/** Full command list, using the executing harness's scoped skill inventory. */
+export function buildAvailableCommands(skills: readonly SkillEntry[] = []): AvailableCommand[] {
   const commands: AvailableCommand[] = [
     {
       name: "model",
@@ -90,7 +86,7 @@ export function buildAvailableCommands(cwd: string): AvailableCommand[] {
     });
   }
   const seen = new Set(commands.map((c) => c.name));
-  for (const skill of discoverSkills(cwd)) {
+  for (const skill of skills) {
     if (seen.has(skill.name)) continue;
     seen.add(skill.name);
     commands.push({
@@ -102,72 +98,26 @@ export function buildAvailableCommands(cwd: string): AvailableCommand[] {
   return commands;
 }
 
-interface SkillEntry {
+export interface SkillEntry {
   name: string;
   description: string;
 }
 
-/** Skills from the bundled letta-code package, global dir, and project dir. */
-function discoverSkills(cwd: string): SkillEntry[] {
-  const roots: string[] = [];
-  const bundled = bundledSkillsDir();
-  if (bundled) roots.push(bundled);
-  roots.push(join(homedir(), ".letta", "skills"));
-  roots.push(join(cwd, ".claude", "skills"));
-
+/** No filesystem fallback: adapter-local skills may not exist on the runtime. */
+export function runtimeSkills(raw: Record<string, unknown>): SkillEntry[] | undefined {
+  if (!Array.isArray(raw.current_available_skills)) return undefined;
   const skills = new Map<string, SkillEntry>();
-  for (const root of roots) {
-    if (!existsSync(root)) continue;
-    let entries: string[];
-    try {
-      entries = readdirSync(root);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const skillFile = join(root, entry, "SKILL.md");
-      if (!existsSync(skillFile)) continue;
-      const parsed = parseSkillFrontmatter(skillFile);
-      if (!parsed) continue;
-      // Slash names must be typable; fall back to the directory name when the
-      // frontmatter name isn't a clean slug (e.g. "Context Doctor").
-      const name = /^[a-z0-9][a-z0-9-]*$/i.test(parsed.name)
-        ? parsed.name
-        : entry;
-      skills.set(name, { ...parsed, name });
-    }
+  for (const value of raw.current_available_skills) {
+    if (!value || typeof value !== "object") continue;
+    const skill = value as Record<string, unknown>;
+    // The harness name is the invocation target. Never invent a different slug.
+    if (typeof skill.name !== "string" || !/^[a-z0-9][a-z0-9-]*$/i.test(skill.name)) continue;
+    const description = typeof skill.description === "string" && skill.description.trim()
+      ? skill.description.trim() : `Invoke the ${skill.name} skill`;
+    if (!skills.has(skill.name)) skills.set(skill.name, {
+      name: skill.name,
+      description: description.length > 160 ? `${description.slice(0, 157)}...` : description,
+    });
   }
   return [...skills.values()].sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function bundledSkillsDir(): string | null {
-  try {
-    const require = createRequire(import.meta.url);
-    const cliPath = require.resolve("@letta-ai/letta-code");
-    return join(dirname(cliPath), "skills");
-  } catch {
-    return null;
-  }
-}
-
-function parseSkillFrontmatter(skillFile: string): SkillEntry | null {
-  let text: string;
-  try {
-    text = readFileSync(skillFile, "utf8");
-  } catch {
-    return null;
-  }
-  const match = text.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
-  const frontmatter = match[1] ?? "";
-  const name = frontmatter.match(/^name:\s*(.+)$/m)?.[1]?.trim();
-  const description = frontmatter
-    .match(/^description:\s*(.+)$/m)?.[1]
-    ?.trim();
-  if (!name) return null;
-  const shortDescription =
-    description && description.length > 160
-      ? `${description.slice(0, 157)}...`
-      : (description ?? `Invoke the ${name} skill`);
-  return { name, description: shortDescription };
 }
