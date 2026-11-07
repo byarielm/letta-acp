@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { namingConfigFromEnv, type NamingConfig } from "./conversation-title.js";
 import type {
   LettaCodeClientOptions,
   PermissionMode,
@@ -12,6 +13,8 @@ export interface LettaAcpConfig {
   agentId?: string;
   /** Model override for sessions (e.g. "anthropic/claude-sonnet-4"). */
   model?: string;
+  /** Independent conversation title generation; never changes the chat model. */
+  naming?: NamingConfig;
   /** Letta permission mode; tool approvals are forwarded to the ACP client. */
   permissionMode: PermissionMode;
   /** Directory for controller-owned ACP session metadata; null keeps it in memory. */
@@ -129,6 +132,7 @@ export function configFromEnv(
     clientOptions,
     agentId: env.LETTA_AGENT_ID,
     model: env.LETTA_ACP_MODEL,
+    naming: namingConfigFromEnv(env),
     permissionMode: permissionMode as PermissionMode,
     ...(Number.isFinite(activeRunSilenceMs) && activeRunSilenceMs > 0
       ? { activeRunSilenceMs }

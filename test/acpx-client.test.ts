@@ -26,9 +26,11 @@ afterEach(() => {
 function startFakeAppServer(
   onReply?: (emitLate: () => void) => void,
   unconfirmedFirst = false,
+  history: WireMessage[] = [],
 ) {
   let replyCount = 0;
   let reloaded = false;
+  let conversationTitle = TEST_CONVERSATION.summary;
   const server = Bun.serve<{ channel: "control" | "stream" }>({
     hostname: "127.0.0.1",
     port: 0,
@@ -81,15 +83,22 @@ function startFakeAppServer(
               type: "conversation_retrieve_response",
               request_id: requiredString(message.request_id),
               success: true,
-              conversation: TEST_CONVERSATION,
+              conversation: { ...TEST_CONVERSATION, summary: conversationTitle },
             }));
             return;
+          case "conversation_update": {
+            const body = message.body as WireMessage;
+            if (typeof body.summary === "string") conversationTitle = body.summary;
+            socket.send(JSON.stringify({ type: "conversation_update_response", request_id: message.request_id,
+              success: true, conversation: { ...TEST_CONVERSATION, summary: conversationTitle } }));
+            return;
+          }
           case "conversation_messages_list":
             socket.send(JSON.stringify({
               type: "conversation_messages_list_response",
               request_id: requiredString(message.request_id),
               success: true,
-              messages: [],
+              messages: [...history].reverse(),
               has_more: false,
             }));
             return;
@@ -257,10 +266,11 @@ async function runAcpx(
   command: string[] = ["exec", "Exercise the ACP tool lifecycle."],
   seedSession = false,
   unconfirmedFirst = false,
+  naming: { env?: Record<string, string>; history?: WireMessage[] } = {},
 ) {
   const home = mkdtempSync(join(tmpdir(), "letta-acp-acpx-"));
   tempDirs.push(home);
-  const appServerUrl = startFakeAppServer(undefined, unconfirmedFirst);
+  const appServerUrl = startFakeAppServer(undefined, unconfirmedFirst, naming.history);
   const cwd = join(import.meta.dir, "..");
   if (seedSession) {
     const registry = new SessionRegistry(
@@ -296,8 +306,10 @@ async function runAcpx(
         LETTA_ACP_BACKEND: "remote",
         // Do not inherit a live Zed model override: this server has no model-switch handler.
         LETTA_ACP_MODEL: undefined,
+        LETTA_ACP_NAMING_MODE: "off",
         LETTA_APP_SERVER_URL: appServerUrl,
         LETTA_AGENT_ID: TEST_RUNTIME.agent_id,
+        ...naming.env,
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -457,6 +469,7 @@ describe("acpx client compatibility", () => {
     let commandsReceived = false;
     let runtimeSkillsReceived = false;
     let runtimeCommandsReloaded = false;
+    let titleReceived = false;
     let buffer = "";
     const decoder = new TextDecoder();
     try {
@@ -488,6 +501,10 @@ describe("acpx client compatibility", () => {
             }
           }
           if (message.params?.update?.content?.text === "ACPX_OK") replies += 1;
+          if (message.params?.update?.sessionUpdate === "session_info_update") {
+            expect(message.params.update.title).toBe("ACP restored conversation");
+            titleReceived = true;
+          }
           if (message.id === 1) send(2, "session/new", { cwd: home, mcpServers: [] });
           if (message.id === 2) {
             sessionId = message.result.sessionId;
@@ -517,6 +534,17 @@ describe("acpx client compatibility", () => {
           if (message.id === 5) {
             expect(message.result.stopReason).toBe("end_turn");
             expect(runtimeCommandsReloaded).toBe(true);
+            send(6, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/rename ACP restored conversation" }] });
+          }
+          if (message.id === 6) {
+            expect(message.result.stopReason).toBe("end_turn");
+            expect(titleReceived).toBe(true);
+            send(7, "session/list", { cwd: home });
+          }
+          if (message.id === 7) {
+            expect(message.result.sessions).toContainEqual(expect.objectContaining({
+              sessionId, title: "ACP restored conversation",
+            }));
             break outer;
           }
         }
@@ -549,6 +577,33 @@ describe("acpx client compatibility", () => {
     // Even an immediate prompt on a fresh session must wait for discovery.
     const { stdout } = await runAcpx("quiet", ["exec", "/project-status src"]);
     expect(stdout.trim()).toBe("PROJECT_STATUS_OK");
+  }, acpxTestTimeoutMs);
+
+  test("persists an exact conversation rename through a real ACP client", async () => {
+    const { stdout } = await runAcpx("quiet", ["exec", "/rename A precise saved title"]);
+    expect(stdout.trim()).toBe("Conversation renamed to: A precise saved title");
+  }, acpxTestTimeoutMs);
+
+  test("retitles through a local model without forwarding the command to the agent", async () => {
+    let inferenceCalls = 0;
+    const local = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      expect(new URL(request.url).pathname).toBe("/api/chat");
+      const body = await request.json() as WireMessage;
+      expect(body).toMatchObject({ model: "test-qwen", think: false, stream: false });
+      expect(JSON.stringify(body.messages)).toContain("Focus on command discovery");
+      inferenceCalls++;
+      return Response.json({ message: { content: "ACP Command Discovery" } });
+    } });
+    try {
+      const { stdout } = await runAcpx("quiet", ["exec", "/retitle Focus on command discovery"], false, false, {
+        env: { LETTA_ACP_NAMING_MODE: "local", LETTA_ACP_NAMING_MODEL: "test-qwen",
+          LETTA_ACP_NAMING_ENDPOINT: `http://127.0.0.1:${local.port}` },
+        history: [{ message_type: "user_message", content: "Make skills visible in Zed" },
+          { message_type: "assistant_message", content: "Use runtime skill inventory" }],
+      });
+      expect(stdout.trim()).toBe("Conversation renamed to: ACP Command Discovery");
+      expect(inferenceCalls).toBe(1);
+    } finally { local.stop(true); }
   }, acpxTestTimeoutMs);
 
   test("a real ACP client waits past an unconfirmed synthetic completion", async () => {

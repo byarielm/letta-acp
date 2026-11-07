@@ -6,6 +6,7 @@ import type { AgentContext, McpServer } from "@agentclientprotocol/sdk";
 import type { LettaCodeModelEntry, LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
 import { LettaAcpAgent, toSdkMcpServers } from "../src/agent.js";
 import { SessionRegistry } from "../src/session-registry.js";
+import type { NamingConfig } from "../src/conversation-title.js";
 
 interface RuntimeScope {
   agent_id: string;
@@ -31,6 +32,11 @@ class FakeAppServer {
   readonly modelRequests: WireMessage[] = [];
   readonly providerRequests: WireMessage[] = [];
   readonly commandRequests: WireMessage[] = [];
+  readonly runtimeRequests: WireMessage[] = [];
+  readonly conversationUpdates: WireMessage[] = [];
+  readonly conversationSummaries = new Map<string, string>();
+  historyMessages: WireMessage[] = [];
+  private scratchConversations = new Set<string>();
   deviceStatus: WireMessage = { current_available_skills: [] };
   commandOutputs: Record<string, string> = {};
   reloadDeviceStatus?: WireMessage;
@@ -237,7 +243,14 @@ class FakeAppServer {
     }
 
     switch (message.type) {
+      case "app_server_info":
+        socket.push({ type: "app_server_info_response", request_id: message.request_id, success: true,
+          backend: "local", letta_code_version: "0.34.39", protocol_version: 2,
+          capabilities: { agent_management: true, conversation_management: true, memory_management: true,
+            runtime_start: true, agent_free_conversations: true, split_channels: true } });
+        return;
       case "runtime_start": {
+        this.runtimeRequests.push(message);
         const requestId = requiredString(message.request_id, "runtime_start.request_id");
         const conversationId = typeof message.conversation_id === "string"
           ? message.conversation_id
@@ -255,6 +268,9 @@ class FakeAppServer {
           agent_id: agentId,
           conversation_id: conversationId,
         };
+        if ((message.create_conversation as { body?: { system?: unknown } } | undefined)?.body?.system) {
+          this.scratchConversations.add(conversationId);
+        }
         this.runtimeStartRequestIds.push(requestId);
         if (createAgent?.body) {
           this.createdAgentBodies.push(createAgent.body);
@@ -307,8 +323,18 @@ class FakeAppServer {
             id: conversationId,
             agent_id: conversationId.includes("foreign") ? "agent-other" : "agent-test",
             archived: conversationId.includes("archived"),
+            summary: this.conversationSummaries.get(conversationId),
           },
         });
+        return;
+      }
+      case "conversation_update": {
+        this.conversationUpdates.push(message);
+        const id = requiredString(message.conversation_id, "conversation_update.conversation_id");
+        const body = message.body as WireMessage;
+        if (typeof body.summary === "string") this.conversationSummaries.set(id, body.summary);
+        socket.push({ type: "conversation_update_response", request_id: message.request_id, success: true,
+          conversation: { id, agent_id: "agent-test", summary: this.conversationSummaries.get(id), archived: body.archived === true } });
         return;
       }
       case "conversation_messages_list":
@@ -320,7 +346,8 @@ class FakeAppServer {
             "conversation_messages_list.request_id",
           ),
           success: true,
-          messages: [],
+          messages: (message.query as { order?: string } | undefined)?.order === "asc"
+            ? this.historyMessages : [...this.historyMessages].reverse(),
           has_more: false,
         });
         return;
@@ -485,6 +512,12 @@ class FakeAppServer {
     }
 
     const promptText = JSON.stringify(payload.messages);
+    if (this.scratchConversations.has(runtime.conversation_id)) {
+      this.pushDelta(socket, runtime, { message_type: "assistant_message", run_id: "run-title",
+        content: "Hosted Conversation Naming" });
+      this.pushDelta(socket, runtime, { message_type: "stop_reason", run_id: "run-title", stop_reason: "end_turn" });
+      return;
+    }
     const promptNumber = ++this.promptCount;
     if (promptText.includes("unconfirmed prompt")) {
       this.cancelablePromptActive = true;
@@ -856,6 +889,7 @@ function createAgent(
     sessionRegistryScope?: string;
     outOfTurnPermissionTimeoutMs?: number;
     prematureResultGraceMs?: number;
+    naming?: NamingConfig;
   } = {},
 ): LettaAcpAgent {
   return new LettaAcpAgent({
@@ -920,6 +954,150 @@ async function openSession(
 }
 
 describe("Agent SDK app-server integration", () => {
+  test("automatic local naming runs behind prompt completion and can be cancelled", async () => {
+    const server = new FakeAppServer();
+    server.historyMessages = [{ id: "u", message_type: "user_message", content: "Name the ACP work" },
+      { id: "a", message_type: "assistant_message", content: "Use local naming" }];
+    let started!: () => void;
+    let release!: () => void;
+    const inferenceStarted = new Promise<void>((resolve) => { started = resolve; });
+    const inferenceGate = new Promise<void>((resolve) => { release = resolve; });
+    const local = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
+      started(); await inferenceGate;
+      return Response.json({ message: { content: "Local Conversation Naming" } });
+    } });
+    const agent = createAgent(server, { naming: { mode: "local", model: "test-qwen",
+      endpoint: `http://127.0.0.1:${local.port}`, afterTurns: 1, timeoutMs: 1_000 } });
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      // Automatic inference starts after the normal ACP response is already returned.
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "Name the ACP work" }] }, context)).toEqual({ stopReason: "end_turn" });
+      await inferenceStarted;
+      expect(server.conversationUpdates).toHaveLength(0);
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "Continue the discussion" }] }, context)).toEqual({ stopReason: "end_turn" });
+      await agent.cancel({ sessionId: session.sessionId });
+      release();
+      await Bun.sleep(10);
+      expect(server.conversationUpdates).toHaveLength(0);
+    } finally { release(); agent.shutdown(); local.stop(true); }
+  });
+
+  test("cancels an adapter-native retitle without aborting the agent model stream", async () => {
+    const server = new FakeAppServer();
+    server.historyMessages = [{ id: "u", message_type: "user_message", content: "Name the ACP work" },
+      { id: "a", message_type: "assistant_message", content: "Use local naming" }];
+    let started!: () => void;
+    let release!: () => void;
+    const inferenceStarted = new Promise<void>((resolve) => { started = resolve; });
+    const inferenceGate = new Promise<void>((resolve) => { release = resolve; });
+    const local = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
+      started(); await inferenceGate;
+      return Response.json({ message: { content: "Cancelled Title" } });
+    } });
+    const agent = createAgent(server, { naming: { mode: "local", model: "test-qwen",
+      endpoint: `http://127.0.0.1:${local.port}`, afterTurns: 3, timeoutMs: 1_000 } });
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const pending = agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "/retitle" }] }, context);
+      await inferenceStarted;
+      await agent.cancel({ sessionId: session.sessionId });
+      expect(await pending).toEqual({ stopReason: "cancelled" });
+      expect(server.conversationUpdates).toHaveLength(0);
+      release();
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "plain prompt" }] }, context)).toEqual({ stopReason: "end_turn" });
+    } finally { release(); agent.shutdown(); local.stop(true); }
+  });
+
+  test("auto-names after a successful turn, saves the title, and preserves it on resume", async () => {
+    const server = new FakeAppServer();
+    server.historyMessages = [
+      { id: "title-user", message_type: "user_message", content: "Fix ACP cancellation" },
+      { id: "title-assistant", message_type: "assistant_message", content: "We will trace the turn lifecycle" },
+    ];
+    const agent = createAgent(server, { naming: {
+      mode: "message", endpoint: "http://127.0.0.1:11434", afterTurns: 1, timeoutMs: 1_000,
+    } });
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "Fix ACP cancellation" }] }, context)).toEqual({ stopReason: "end_turn" });
+      await Bun.sleep(10);
+      expect(server.conversationSummaries.get(session.sessionId)).toBe("Fix ACP cancellation");
+      expect(updates).toContainEqual({ sessionUpdate: "session_info_update", title: "Fix ACP cancellation" });
+      await agent.loadSession({ sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Continue" }] }, context);
+      await Bun.sleep(10);
+      expect(server.conversationUpdates).toHaveLength(1);
+    } finally { agent.shutdown(); }
+  });
+
+  test("rename saves an exact title with naming disabled and never sends a model turn", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "/rename Exact ACP title #2" }] }, context)).toEqual({ stopReason: "end_turn" });
+      expect(server.conversationSummaries.get(session.sessionId)).toBe("Exact ACP title #2");
+      expect(server.commandRequests).toHaveLength(0);
+      expect(updates).toContainEqual({ sessionUpdate: "session_info_update", title: "Exact ACP title #2" });
+      expect(updates).not.toContainEqual({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "PROMPT_OK" } });
+    } finally { agent.shutdown(); }
+  });
+
+  test("naming configuration selects a separate hosted model without updating the chat model", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { naming: { mode: "local", model: "qwen-test",
+      endpoint: "http://127.0.0.1:11434", afterTurns: 3, timeoutMs: 1_000 } });
+    const { context } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const hosted = await agent.setSessionConfigOption({ sessionId: session.sessionId,
+        configId: "naming", value: "subscription" });
+      expect(hosted.configOptions.find((option) => option.id === "naming-model")?.currentValue).toBe("unconfigured");
+      const selected = await agent.setSessionConfigOption({ sessionId: session.sessionId,
+        configId: "naming-model", value: "other-model" });
+      expect(selected.configOptions.find((option) => option.id === "naming-model")?.currentValue).toBe("other-model");
+      expect(selected.configOptions.find((option) => option.id === "model")?.currentValue).toBe("test-model");
+      expect(server.updatedModelPayloads).toHaveLength(0);
+    } finally { agent.shutdown(); }
+  });
+
+  test("subscription retitle uses a separate tool-free query and archives it without changing the chat model", async () => {
+    const server = new FakeAppServer();
+    server.modelEntries.push({ id: "title-model", handle: "test/title-model", label: "Free title model", description: "Test naming model", free: true });
+    server.historyMessages = [
+      { id: "u", message_type: "user_message", content: "Find a better ACP title" },
+      { id: "a", message_type: "assistant_message", content: "Use a separate naming model" },
+    ];
+    const agent = createAgent(server, { naming: { mode: "subscription", model: "test/title-model",
+      requireFree: true, endpoint: "http://127.0.0.1:11434", afterTurns: 3, timeoutMs: 1_000 } });
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(await agent.prompt({ sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "/retitle Focus on naming" }] }, context)).toEqual({ stopReason: "end_turn" });
+      expect(server.conversationSummaries.get(session.sessionId)).toBe("Hosted Conversation Naming");
+      const scratch = server.runtimeRequests.find((request) =>
+        (request.create_conversation as { body?: { model?: string } } | undefined)?.body?.model === "test/title-model");
+      expect(scratch).toBeDefined();
+      expect(scratch).not.toHaveProperty("agent_id");
+      expect(scratch?.skill_sources).toEqual([]);
+      expect(server.updatedModelPayloads).toHaveLength(0);
+      expect(server.conversationUpdates.some((update) => (update.body as WireMessage).archived === true)).toBe(true);
+      expect(updates).not.toContainEqual({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Hosted Conversation Naming" } });
+      expect(updates).toContainEqual({ sessionUpdate: "session_info_update", title: "Hosted Conversation Naming" });
+    } finally { agent.shutdown(); }
+  });
+
   test("cancels discovery before dispatch without leaving an interrupted result", async () => {
     const server = new FakeAppServer();
     let release!: () => void;
@@ -1977,6 +2155,7 @@ describe("Agent SDK app-server integration", () => {
             ],
           }],
         },
+        expect.objectContaining({ id: "naming", type: "select", currentValue: "off" }),
       ]);
     } finally {
       agent.shutdown();

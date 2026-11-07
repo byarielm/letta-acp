@@ -4,7 +4,7 @@ import type { AvailableCommand } from "@agentclientprotocol/sdk";
  * Slash-command surface exposed to ACP clients.
  *
  * Three kinds:
- * - native: implemented in the adapter itself (/model)
+ * - native: implemented in the adapter itself (/model, /retitle, /rename)
  * - execute: dispatched to the Letta harness via the app-server protocol's
  *   `execute_command` (results stream back as slash_command_start/end)
  * - text: forwarded to the model as prompt text; the harness instructs the
@@ -65,6 +65,7 @@ const TEXT_COMMANDS: ExecuteCommandSpec[] = [
 ];
 
 const EXECUTE_COMMAND_NAMES = new Set(EXECUTE_COMMANDS.map((c) => c.name));
+const NATIVE_COMMAND_NAMES = new Set(["model", "retitle", "rename"]);
 
 export interface RuntimeCommands {
   /** Undefined means the older runtime did not report a supported-command list. */
@@ -77,7 +78,7 @@ function executeCommands(runtime?: RuntimeCommands): ExecuteCommandSpec[] {
     !runtime?.supported || runtime.supported.has(spec.name));
   // The harness routes built-ins before mod commands; /model belongs to ACP.
   const mods = runtime?.mods.filter((spec) =>
-    spec.name !== "model" && !EXECUTE_COMMAND_NAMES.has(spec.name)) ?? [];
+    !NATIVE_COMMAND_NAMES.has(spec.name) && !EXECUTE_COMMAND_NAMES.has(spec.name)) ?? [];
   return [...builtins, ...mods];
 }
 
@@ -97,7 +98,7 @@ export function runtimeCommands(raw: Record<string, unknown>, previous?: Runtime
       if (!value || typeof value !== "object") continue;
       const command = value as Record<string, unknown>;
       if (typeof command.id !== "string" || !/^[a-z0-9][a-z0-9-]*$/.test(command.id)) continue;
-      if (command.id === "model" || EXECUTE_COMMAND_NAMES.has(command.id) || mods.has(command.id)) continue;
+      if (NATIVE_COMMAND_NAMES.has(command.id) || EXECUTE_COMMAND_NAMES.has(command.id) || mods.has(command.id)) continue;
       const description = typeof command.description === "string" && command.description.trim()
         ? command.description.trim() : `Run /${command.id}`;
       mods.set(command.id, {
@@ -119,6 +120,8 @@ export function buildAvailableCommands(skills: readonly SkillEntry[] = [], runti
       description: "Show available models or switch the session's model",
       input: { hint: "model handle (leave empty to list)" },
     },
+    { name: "retitle", description: "Regenerate the saved conversation title", input: { hint: "optional naming guidance" } },
+    { name: "rename", description: "Set an exact conversation title without a model", input: { hint: "exact title (1–100 characters)" } },
   ];
   const seen = new Set(commands.map((c) => c.name));
   for (const spec of [...executeCommands(runtime), ...TEXT_COMMANDS]) {

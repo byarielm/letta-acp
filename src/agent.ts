@@ -39,6 +39,8 @@ import {
 import { authMethodsForClient } from "./auth.js";
 import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
 import { debug } from "./debug.js";
+import { ConversationNamer } from "./conversation-naming.js";
+import { titleMessagesFromHistory, type NamingMode, type TitleMessage } from "./conversation-title.js";
 import {
   createEditorTools,
   type EditorFsCapabilities,
@@ -131,6 +133,8 @@ interface AcpSessionState {
   waitingForCommandDiscovery?: boolean;
   commandsActive?: boolean;
   lastCommands?: string;
+  namer?: ConversationNamer;
+  adapterCommandActive?: boolean;
   /** Cached model catalog, shared by every config request in its TTL window. */
   modelCatalog?: {
     expiresAt: number;
@@ -200,6 +204,7 @@ export class LettaAcpAgent {
   private readonly commandAnnouncements = new Set<ReturnType<typeof setImmediate>>();
   private agentIdPromise: Promise<string> | null = null;
   private supportsTerminalOutput = false;
+  private readonly namingTasks = new Set<Promise<unknown>>();
   private clientFsCaps: EditorFsCapabilities = {
     readTextFile: false,
     writeTextFile: false,
@@ -580,6 +585,32 @@ export class LettaAcpAgent {
     if (thoughtLevel) {
       configOptions.push(thoughtLevel);
     }
+    if (state.namer) {
+      const naming = state.namer.config;
+      configOptions.push({
+        id: "naming", name: "Conversation naming", category: "other", type: "select",
+        description: "Independent of the chat model; persistent defaults come from LETTA_ACP_NAMING_*",
+        currentValue: naming.mode,
+        options: [
+          { value: "off", name: "Off" },
+          { value: "message", name: "From first message (no model)" },
+          { value: "subscription", name: "Subscription / hosted model" },
+          { value: "local", name: `Local Ollama (${naming.localModel ?? "qwen3.5:9b-q4_K_M"})` },
+        ],
+      });
+      if (naming.mode === "subscription") {
+        const choices = models.filter((entry) => !naming.requireFree || entry.free === true)
+          .map((entry) => ({ value: entry.id, name: `${entry.label}${entry.free ? " (free)" : ""}` }));
+        const selected = models.find((entry) => entry.id === naming.model || entry.handle === naming.model)?.id;
+        const selectedValue = selected ?? naming.model ?? "unconfigured";
+        if (!choices.some((entry) => entry.value === selectedValue)) {
+          choices.unshift({ value: selectedValue, name: naming.model ?? "Choose a naming model" });
+        }
+        configOptions.push({ id: "naming-model", name: "Naming model", category: "other", type: "select",
+          description: naming.requireFree ? "Only explicitly free models; local fallback if free access is unavailable" : "Used only for naming, never the chat model",
+          currentValue: selectedValue, options: choices });
+      }
+    }
     return configOptions;
   }
 
@@ -590,6 +621,22 @@ export class LettaAcpAgent {
     const state = this.sessions.get(params.sessionId);
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
+    }
+    if (params.configId === "naming") {
+      if (!state.namer || typeof params.value !== "string" || !["off", "message", "subscription", "local"].includes(params.value)) {
+        throw new Error("Unknown conversation naming mode");
+      }
+      state.namer.setMode(params.value as NamingMode);
+      return { configOptions: await this.sessionConfigOptions(state) };
+    }
+    if (params.configId === "naming-model") {
+      if (!state.namer || state.namer.config.mode !== "subscription" || typeof params.value !== "string") {
+        throw new Error("Choose subscription naming before selecting a naming model");
+      }
+      const entry = (await this.sessionModels(state)).find((model) => model.id === params.value || model.handle === params.value);
+      if (!entry || (state.namer.config.requireFree && entry.free !== true)) throw new Error("That model is unavailable for the configured naming policy");
+      state.namer.setModel(entry.handle);
+      return { configOptions: await this.sessionConfigOptions(state) };
     }
     if (params.configId === PERMISSION_MODE_CONFIG_ID) {
       if (typeof params.value !== "string" || !isSessionModeId(params.value)) {
@@ -726,6 +773,7 @@ export class LettaAcpAgent {
       } catch (error) {
         log(`reopening unavailable session ${options.resumeId}: ${String(error)}`);
         existing.reader?.stop();
+        existing.namer?.close();
         existing.stopCommandUpdates?.();
         existing.session.close();
       }
@@ -803,11 +851,101 @@ export class LettaAcpAgent {
     const displaced = this.sessions.get(sessionId);
     if (displaced && displaced.session !== session) {
       displaced.reader?.stop();
+      displaced.namer?.close();
       displaced.stopCommandUpdates?.();
       displaced.session.close();
     }
     this.sessions.set(sessionId, state);
+    state.namer = this.createNamer(sessionId, state);
     return { sessionId, state };
+  }
+
+  private createNamer(sessionId: string, state: AcpSessionState): ConversationNamer {
+    return new ConversationNamer(this.config.naming ?? {
+      mode: "off", endpoint: "http://127.0.0.1:11434", afterTurns: 3, timeoutMs: 60_000,
+    }, {
+      retrieve: () => this.client.conversations.retrieve(sessionId),
+      update: async (title) => { await this.client.conversations.update(sessionId, { summary: title }); },
+      history: () => this.titleHistory(state.session),
+      subscriptionGenerate: (model, system, prompt, signal, requireFree) => {
+        const task = this.generateSubscriptionTitle(state, model, system, prompt, signal, requireFree);
+        this.namingTasks.add(task);
+        void task.finally(() => this.namingTasks.delete(task)).catch(() => {});
+        return task;
+      },
+      titleChanged: (title) => state.clientContext.notify(methods.client.session.update, {
+        sessionId, update: { sessionUpdate: "session_info_update", title },
+      }),
+      isCurrent: () => this.sessions.get(sessionId) === state,
+      log,
+    });
+  }
+
+  private async titleHistory(session: LettaCodeSession): Promise<TitleMessage[]> {
+    const recent = await session.listMessages({ order: "desc", limit: 60 });
+    const chronological = [...recent.messages].reverse();
+    if (!recent.hasMore) return titleMessagesFromHistory(chronological);
+    const opening = await session.listMessages({ order: "asc", limit: 12 });
+    const seen = new Set<string>();
+    const messages = [...opening.messages, ...chronological].filter((value) => {
+      const id = value && typeof value === "object" ? (value as { id?: unknown }).id : undefined;
+      if (typeof id !== "string") return true;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+    return titleMessagesFromHistory(messages);
+  }
+
+  private async generateSubscriptionTitle(state: AcpSessionState, model: string, system: string,
+    prompt: string, signal: AbortSignal, requireFree: boolean): Promise<string> {
+    signal.throwIfAborted();
+    if (requireFree) {
+      const entries = (await state.session.listModels()).entries;
+      signal.throwIfAborted();
+      if (!entries.some((entry) => (entry.id === model || entry.handle === model) && entry.free === true)) {
+        throw new Error("The runtime no longer explicitly marks the naming model free");
+      }
+    }
+    // An agent-free scratch conversation avoids running a naming prompt inside
+    // the user's agent, changing its model, or exposing tools and memory.
+    const query = this.client.query({ prompt, options: {
+      model, system, name: "ACP conversation naming", isSubagent: true,
+      allowedTools: [], tools: [], mcpServers: {}, skillSources: [],
+      canUseTool: () => ({ behavior: "deny", message: "Conversation naming has no tools" }),
+    } });
+    const abort = () => {
+      void query.interrupt().catch(() => {});
+      query.close();
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    let output = "";
+    let completed = false;
+    try {
+      signal.throwIfAborted();
+      for await (const message of query) {
+        signal.throwIfAborted();
+        if (message.type === "assistant") {
+          output += message.content;
+          if (output.length > 4_096) throw new Error("Naming model returned excessive output");
+        }
+        if (message.type === "result") {
+          if (!message.success) throw new Error(message.errorDetail ?? message.error ?? "Naming model failed");
+          completed = true;
+          break;
+        }
+      }
+      signal.throwIfAborted();
+      if (!completed) throw new Error("Naming model did not confirm completion");
+      return output;
+    } finally {
+      signal.removeEventListener("abort", abort);
+      query.close();
+      if (query.conversationId) {
+        try { await this.client.conversations.update(query.conversationId, { archived: true }); }
+        catch (error) { log(`could not archive temporary naming conversation: ${String(error)}`); }
+      }
+    }
   }
 
   private startReader(sessionId: string, state: AcpSessionState): SessionReader {
@@ -863,6 +1001,20 @@ export class LettaAcpAgent {
   }
 
   async prompt(
+    params: PromptRequest,
+    cx: AgentContext,
+  ): Promise<PromptResponse> {
+    const state = this.sessions.get(params.sessionId);
+    const result = await this.runPrompt(params, cx);
+    if (result.stopReason === "end_turn" && titleMessagesFromHistory([{
+      message_type: "user_message", content: params.prompt.filter((part) => part.type === "text"),
+    }]).length > 0) {
+      if (this.sessions.get(params.sessionId) === state) state?.namer?.maybeAutoTitle();
+    }
+    return result;
+  }
+
+  private async runPrompt(
     params: PromptRequest,
     cx: AgentContext,
   ): Promise<PromptResponse> {
@@ -1038,6 +1190,25 @@ export class LettaAcpAgent {
     const command = (match[1] ?? "").toLowerCase();
     const argument = match[2]?.trim();
 
+    if (command === "retitle" || command === "rename") {
+      let text: string;
+      state.adapterCommandActive = true;
+      try {
+        if (!state.namer) throw new Error("Conversation naming is unavailable");
+        const title = command === "rename"
+          ? await state.namer.rename(argument ?? "")
+          : await state.namer.retitle(argument);
+        text = `Conversation renamed to: ${title}`;
+      } catch (error) {
+        if (state.cancelled) return { stopReason: "cancelled" };
+        text = `/${command} failed: ${error instanceof Error ? error.message : String(error)}`;
+      } finally {
+        state.adapterCommandActive = false;
+      }
+      await cx.notify(methods.client.session.update, { sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } });
+      return { stopReason: "end_turn" };
+    }
     if (isExecuteCommand(command, state.runtimeCommands)) {
       return this.runExecuteCommand(params.sessionId, state, cx, command, argument);
     }
@@ -1297,8 +1468,9 @@ export class LettaAcpAgent {
     const state = this.sessions.get(params.sessionId);
     if (!state) return;
     state.cancelled = true;
+    state.namer?.cancel();
     // No turn was sent yet; aborting here would create an orphaned SDK result.
-    if (state.waitingForCommandDiscovery) return;
+    if (state.waitingForCommandDiscovery || state.adapterCommandActive) return;
     // Interrupted tool calls never produce a tool_result, so drop their
     // accumulated arguments here instead of leaking them for the session.
     state.toolCalls.clear();
@@ -1315,6 +1487,7 @@ export class LettaAcpAgent {
     for (const state of this.sessions.values()) {
       try {
         state.reader?.stop();
+        state.namer?.close();
         state.stopCommandUpdates?.();
         state.session.close();
       } catch {
@@ -1322,6 +1495,9 @@ export class LettaAcpAgent {
       }
     }
     this.sessions.clear();
+    void Promise.allSettled([...this.namingTasks]).then(() => this.client.close()).catch((error) => {
+      log(`client shutdown failed: ${String(error)}`);
+    });
   }
 
   /**
