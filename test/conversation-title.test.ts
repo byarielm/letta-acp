@@ -12,6 +12,10 @@ import {
 const base: NamingConfig = { mode: "local", model: "test-model", endpoint: "http://127.0.0.1:11434", afterTurns: 3, timeoutMs: 1_000 };
 
 describe("namingConfigFromEnv", () => {
+  test("accepts concise Auto and Cloud method names without breaking legacy settings", () => {
+    expect(namingConfigFromEnv({ LETTA_ACP_NAMING_MODE: "auto" }).mode).toBe("message");
+    expect(namingConfigFromEnv({ LETTA_ACP_NAMING_MODE: "cloud", LETTA_ACP_NAMING_MODEL: "hosted/free" }).mode).toBe("subscription");
+  });
   test("provides defaults and local model", () => {
     expect(namingConfigFromEnv({})).toEqual({ mode: "message", endpoint: "http://127.0.0.1:11434", afterTurns: 3, timeoutMs: 60_000,
       localModel: "qwen3.5:9b-q4_K_M", requireFree: false });

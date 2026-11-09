@@ -26,7 +26,8 @@ const MAX_RESPONSE_BYTES = 256_000;
 export function namingConfigFromEnv(
   env: Record<string, string | undefined>,
 ): NamingConfig {
-  const mode = env.LETTA_ACP_NAMING_MODE ?? "message";
+  const requestedMode = env.LETTA_ACP_NAMING_MODE ?? "message";
+  const mode = requestedMode === "auto" ? "message" : requestedMode === "cloud" ? "subscription" : requestedMode;
   if (!["off", "message", "subscription", "local"].includes(mode)) {
     throw new Error(`Unknown LETTA_ACP_NAMING_MODE "${mode}"`);
   }
