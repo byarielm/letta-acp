@@ -993,6 +993,78 @@ async function openSession(
 }
 
 describe("Agent SDK app-server integration", () => {
+  test("keeps naming off the composer and configures separate Local and Cloud models through commands", async () => {
+    const server = new FakeAppServer();
+    server.modelEntries.push(
+      { id: "free-title", handle: "free-host/title", label: "Free title", description: "", free: true },
+      { id: "paid-title", handle: "paid-host/title", label: "Paid title", description: "" },
+    );
+    const inventory: string[] = [];
+    const ollama = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+      inventory.push(`${request.method} ${new URL(request.url).pathname}`);
+      return Response.json({ models: [{ name: "qwen:first" }, { name: "qwen:second" }] });
+    } });
+    const agent = createAgent(server, { naming: { mode: "subscription", model: "free-host/title", requireFree: true,
+      endpoint: `http://127.0.0.1:${ollama.port}`, afterTurns: 3, timeoutMs: 1_000 } });
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      expect(session.configOptions?.map((option) => option.id)).toEqual(["permissions", "model"]);
+      const run = async (text: string) => {
+        expect(await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text }] }, context))
+          .toEqual({ stopReason: "end_turn" });
+        return String(([...updates].reverse().find((update) => update.sessionUpdate === "agent_message_chunk")?.content as { text?: string })?.text);
+      };
+      expect(await run("/naming")).toContain("Method: Cloud\nModel: free-host/title");
+      expect(await run("/naming models")).toContain("free-host/title");
+      expect(await run("/naming models")).not.toContain("paid-host/title");
+      expect(await run("/naming model paid-host/title")).toContain("unavailable");
+      expect(await run("/naming method local")).toContain("Method: Local");
+      expect(await run("/naming models")).toContain("qwen:second");
+      expect(await run("/naming model qwen:second")).toContain("Model: qwen:second");
+      expect(await run("/naming model missing-model")).toContain("unavailable");
+      expect(await run("/naming")).toContain("Model: qwen:second");
+      expect(await run("/naming method cloud")).toContain("Model: free-host/title");
+      expect(await run("/naming method local")).toContain("Model: qwen:second");
+      expect(await run("/naming method auto")).toContain("Method: Auto");
+      expect(await run("/naming method off")).toContain("Method: Off");
+      expect(inventory.length).toBeGreaterThan(0);
+      expect(inventory.every((call) => call === "GET /api/tags")).toBe(true);
+      expect(server.updatedModelPayloads).toHaveLength(0);
+      expect(server.commandRequests).toHaveLength(0);
+      expect(server.inputMessages).toHaveLength(0);
+      const config = await agent.setSessionConfigOption({ sessionId: session.sessionId, configId: "permissions", value: "standard" });
+      expect(config.configOptions.map((option) => option.id)).toEqual(["permissions", "model"]);
+    } finally { agent.shutdown(); ollama.stop(true); }
+  });
+
+  test("cancels title model discovery without poisoning the next chat turn", async () => {
+    const server = new FakeAppServer();
+    let started!: () => void;
+    let release!: () => void;
+    const requested = new Promise<void>((resolve) => { started = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ollama = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
+      started(); await gate;
+      return Response.json({ models: [{ name: "qwen:other" }] });
+    } });
+    const agent = createAgent(server, { naming: { mode: "local", model: "qwen:current",
+      endpoint: `http://127.0.0.1:${ollama.port}`, afterTurns: 3, timeoutMs: 1_000 } });
+    const { context, updates } = createContext();
+    try {
+      const session = await openSession(agent, context);
+      const pending = agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "/naming model qwen:other" }] }, context);
+      await requested;
+      await agent.cancel({ sessionId: session.sessionId });
+      expect(await pending).toEqual({ stopReason: "cancelled" });
+      release();
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "/naming" }] }, context);
+      expect(JSON.stringify(updates)).toContain("Model: qwen:current");
+      expect(await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "Normal chat after discovery cancellation" }] }, context))
+        .toEqual({ stopReason: "end_turn" });
+    } finally { release(); agent.shutdown(); ollama.stop(true); }
+  });
+
   test("an internal preflight read does not count as a delivered picker update", async () => {
     const server = new FakeAppServer();
     server.agentState = { id: "agent-test", model: "test/model" };
@@ -1290,10 +1362,11 @@ describe("Agent SDK app-server integration", () => {
       const session = await openSession(agent, context);
       const hosted = await agent.setSessionConfigOption({ sessionId: session.sessionId,
         configId: "naming", value: "subscription" });
-      expect(hosted.configOptions.find((option) => option.id === "naming-model")?.currentValue).toBe("unconfigured");
+      expect(hosted.configOptions.some((option) => option.id.startsWith("naming"))).toBe(false);
       const selected = await agent.setSessionConfigOption({ sessionId: session.sessionId,
         configId: "naming-model", value: "other-model" });
-      expect(selected.configOptions.find((option) => option.id === "naming-model")?.currentValue).toBe("other-model");
+      expect(selected.configOptions.some((option) => option.id.startsWith("naming"))).toBe(false);
+      await agent.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "/naming" }] }, context);
       expect(selected.configOptions.find((option) => option.id === "model")?.currentValue).toBe("test-model");
       expect(server.updatedModelPayloads).toHaveLength(0);
     } finally { agent.shutdown(); }
@@ -2383,7 +2456,6 @@ describe("Agent SDK app-server integration", () => {
             ],
           }],
         },
-        expect.objectContaining({ id: "naming", type: "select", currentValue: "off" }),
       ]);
     } finally {
       agent.shutdown();

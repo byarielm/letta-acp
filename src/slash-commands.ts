@@ -4,7 +4,7 @@ import type { AvailableCommand } from "@agentclientprotocol/sdk";
  * Slash-command surface exposed to ACP clients.
  *
  * Three kinds:
- * - native: implemented in the adapter itself (/model, /retitle, /rename)
+ * - native: implemented in the adapter itself (/model, /naming, /retitle, /rename)
  * - execute: dispatched to the Letta harness via the app-server protocol's
  *   `execute_command` (results stream back as slash_command_start/end)
  * - text: forwarded to the model as prompt text; the harness instructs the
@@ -65,7 +65,7 @@ const TEXT_COMMANDS: ExecuteCommandSpec[] = [
 ];
 
 const EXECUTE_COMMAND_NAMES = new Set(EXECUTE_COMMANDS.map((c) => c.name));
-const NATIVE_COMMAND_NAMES = new Set(["model", "retitle", "rename"]);
+const NATIVE_COMMAND_NAMES = new Set(["model", "naming", "retitle", "rename"]);
 
 export interface RuntimeCommands {
   /** Undefined means the older runtime did not report a supported-command list. */
@@ -121,6 +121,7 @@ export function buildAvailableCommands(skills: readonly SkillEntry[] = [], runti
       input: { hint: "model handle (leave empty to list)" },
     },
     { name: "retitle", description: "Regenerate the saved conversation title", input: { hint: "optional naming guidance" } },
+    { name: "naming", description: "Configure conversation titles without changing the chat model", input: { hint: "method off|auto|cloud|local · models · model <name>" } },
     { name: "rename", description: "Set an exact conversation title without a model", input: { hint: "exact title (1–100 characters)" } },
   ];
   const seen = new Set(commands.map((c) => c.name));

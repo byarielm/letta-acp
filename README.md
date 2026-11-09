@@ -186,7 +186,7 @@ ACP session ids are Letta conversation ids, so `session/load` works across adapt
 
 The adapter advertises the [Letta slash commands](https://docs.letta.com/platform/cli/slash-commands) that make sense over ACP, so they appear in the client's `/` menu:
 
-- **Adapter-native**: `/model`, `/retitle [naming guidance]`, `/rename <exact title>`.
+- **Adapter-native**: `/model`, `/naming`, `/retitle [naming guidance]`, `/rename <exact title>`.
 - **Harness-executed** (via the app-server `execute_command` protocol): the adapter knows `/clear`, `/compact`, `/init`, `/doctor`, `/remember`, `/reflect`, `/context-limit`, `/reload`, and `/toolset`, but filters this list against the runtime's `supported_commands` when reported. For example, current runtimes have removed `/clear`, so it is hidden there. Older runtimes that omit the list retain the legacy command set; this is compatibility behavior, not a guarantee that every command works. Commands that run a full agent turn (`/init`, `/remember`, `/doctor`) stream their tool calls and output like any prompt.
 - **Custom commands**: runtime-advertised `mod_commands` appear with their descriptions and argument hints, and execute through the harness rather than as model prompts. Device-status snapshots refresh registration and removal, including after `/reload`. Adapter-native and built-in names are reserved; custom executable commands take precedence over model-interpreted shortcuts and skills. A previously discovered command that is removed is rejected explicitly rather than silently sent to the model. An immediate slash prompt waits up to 1.5 seconds for initial discovery; ordinary prompts and session creation do not wait. If discovery is unavailable, unknown slash names retain the existing model/skill fallback.
 - **Manual reflection**: `/reflect` starts a background reflection pass on the current conversation without waiting for the automatic reflection threshold. The initial response confirms whether reflection started, not that memory updates have finished. Code-managed reflection accepts `/reflect --instruction <focus>`; Cloud-managed reflection accepts no arguments. Runtime status does not report which reflection argument set is supported, so the menu conservatively advertises bare `/reflect` without an argument hint. The TUI selectors `--recent`, `--conversation`, and `--auto` are not supported on the Code-managed remote command path.
@@ -200,12 +200,24 @@ ACP can save titles on the actual Letta conversation, so they are available when
 
 Automatic naming defaults to a title derived from the first substantive user message, after three completed user/assistant exchanges. It runs in the background and only names conversations whose `summary` is empty; existing titles are preserved on resume. Model-based naming considers a bounded excerpt of the opening and recent discussion, not just the opening message. Tool output, reasoning, slash commands, task notifications, and system reminders are excluded. Model errors leave the conversation untitled and may be retried after another successful turn.
 
-Use the **Conversation naming** session option in Zed to choose `off`, `message`, `subscription`, or `local`. Subscription mode also exposes a **Naming model** selector; a model must be explicitly selected/configured before it can run. These session selections do not change persistent defaults. For persistent settings, add these environment variables to the relevant Zed `agent_servers.<name>.env` block:
+The composer contains only chat controls: permissions, chat model, and thinking. Auxiliary title configuration is accessed through `/naming`, not additional inline pickers. Memory/reflection configuration remains in its existing harness configuration path; the adapter does not add memory-model controls to the composer.
+
+Use `/naming` for status and help. Method and model are independent:
+
+```text
+/naming method off|auto|cloud|local
+/naming models
+/naming model <name>
+```
+
+**Off / Auto / Cloud / Local** are the public method names. Auto derives a title from messages without inference. Cloud and Local each remember their own model selection during this ACP session. `models` lists the active method's choices; Local queries installed Ollama models through `/api/tags` without loading, downloading, or running one. Cloud lists the runtime's hosted catalog independently of chat-provider filtering and honors the free-only policy. Unknown/unavailable model selections are rejected without changing the current model. Selecting a local model also updates the free-only route's local fallback for this session. No naming command switches the chat model or sends the command as a model prompt.
+
+These selections do not change persistent defaults. For persistent settings, add these environment variables to the relevant Zed `agent_servers.<name>.env` block:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LETTA_ACP_NAMING_MODE` | `message` | `off`, `message` (no inference), `subscription` (harness provider/hosted model), or `local` (native Ollama API). |
-| `LETTA_ACP_NAMING_MODEL` | Qwen below for `local`; required for `subscription` | Raw Ollama model name for local mode, or an explicit runtime model handle for subscription mode. No implicit hosted/paid model is selected. |
+| `LETTA_ACP_NAMING_MODE` | `message` | `off`, `auto` (no inference), `cloud` (harness provider/hosted model), or `local` (native Ollama API). Legacy `message` and `subscription` values remain supported. |
+| `LETTA_ACP_NAMING_MODEL` | Qwen below for `local`; required for `cloud` | Raw Ollama model name for Local, or an explicit runtime model handle for Cloud. No implicit hosted/paid model is selected. |
 | `LETTA_ACP_NAMING_LOCAL_MODEL` | `qwen3.5:9b-q4_K_M` | Default local model and fallback model for a free-only subscription route. |
 | `LETTA_ACP_NAMING_ENDPOINT` | `http://127.0.0.1:11434` | Ollama base URL, reached from the computer running the ACP adapter—not necessarily the agent's execution host. Redirects and URL credentials are rejected. An explicitly configured remote endpoint receives the naming excerpt. |
 | `LETTA_ACP_NAMING_AFTER_TURNS` | `3` | Completed substantive exchanges before automatic naming. Manual retitling does not wait for this threshold. |
@@ -219,12 +231,12 @@ For a local Qwen model to do the naming:
 "LETTA_ACP_NAMING_MODEL": "qwen3.5:9b-q4_K_M"
 ```
 
-Subscription naming uses a separate, tool-free, agent-free query conversation and archives it afterward. It does not inject a naming request into the original conversation or switch its model. Local naming calls `/api/chat` with thinking disabled, bounded context/output, and a short model keep-alive. Neither path needs another persistent agent or access to its memory.
+Cloud naming uses a separate, tool-free, agent-free query conversation and archives it afterward. It does not inject a naming request into the original conversation or switch its model. Local naming calls `/api/chat` with thinking disabled, bounded context/output, and a short model keep-alive. Neither path needs another persistent agent or access to its memory.
 
 Subscription naming requires an app-server backend supporting agent-free SDK queries (`local`, `remote`, or `cloud-oauth`). The direct `cloud` SDK backend needs an execution computer for such queries and is not supported for hosted naming here; choose `local`/`message` naming or use `cloud-oauth`. A free-only policy still falls back to local naming if its hosted query is unavailable.
 
 - `/retitle` regenerates a title from the discussion so far, including when an existing title is present.
-- `/retitle Focus on the command-discovery work` supplies optional guidance to a naming model. Message-based mode cannot interpret guidance; select a model mode or use `/rename`.
+- `/retitle Focus on the command-discovery work` supplies optional guidance to a naming model. Auto cannot interpret guidance; use `/naming method cloud` or `/naming method local` and select a model, or use `/rename`.
 - `/rename ACP skill and command discovery` saves those exact words without calling a model, even when automatic naming is off. Exact titles must be a single line of 1–100 characters.
 
 Cancellation, runtime replacement, and shutdown invalidate pending generation. Writes are serialized within a session so an older automatic request cannot overwrite a later exact rename. The adapter also rechecks the saved title before a generated update, preserving a title changed while inference was running. The backend does not expose a conditional title update, so simultaneous writes from separate clients cannot be made fully atomic by the adapter.

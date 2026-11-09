@@ -41,6 +41,7 @@ import { authMethodsForClient } from "./auth.js";
 import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
 import { debug } from "./debug.js";
 import { modelSnapshot } from "./model-settings.js";
+import { localNamingModels, namingMethod, NAMING_METHODS, withNamingCancellation } from "./naming-models.js";
 import { ConversationNamer } from "./conversation-naming.js";
 import { titleMessagesFromHistory, type NamingMode, type TitleMessage } from "./conversation-title.js";
 import {
@@ -146,6 +147,7 @@ interface AcpSessionState {
   lastCommands?: string;
   namer?: ConversationNamer;
   adapterCommandActive?: boolean;
+  namingCommandAbort?: AbortController;
   /** Cached model catalog, shared by every config request in its TTL window. */
   modelCatalog?: {
     expiresAt: number;
@@ -606,33 +608,67 @@ export class LettaAcpAgent {
     if (thoughtLevel) {
       configOptions.push(thoughtLevel);
     }
-    if (state.namer) {
-      const naming = state.namer.config;
-      configOptions.push({
-        id: "naming", name: "Conversation naming", category: "other", type: "select",
-        description: "Independent of the chat model; persistent defaults come from LETTA_ACP_NAMING_*",
-        currentValue: naming.mode,
-        options: [
-          { value: "off", name: "Off" },
-          { value: "message", name: "From first message (no model)" },
-          { value: "subscription", name: "Subscription / hosted model" },
-          { value: "local", name: `Local Ollama (${naming.localModel ?? "qwen3.5:9b-q4_K_M"})` },
-        ],
-      });
-      if (naming.mode === "subscription") {
-        const choices = models.filter((entry) => !naming.requireFree || entry.free === true)
-          .map((entry) => ({ value: entry.id, name: `${entry.label}${entry.free ? " (free)" : ""}` }));
-        const selected = models.find((entry) => entry.id === naming.model || entry.handle === naming.model)?.id;
-        const selectedValue = selected ?? naming.model ?? "unconfigured";
-        if (!choices.some((entry) => entry.value === selectedValue)) {
-          choices.unshift({ value: selectedValue, name: naming.model ?? "Choose a naming model" });
-        }
-        configOptions.push({ id: "naming-model", name: "Naming model", category: "other", type: "select",
-          description: naming.requireFree ? "Only explicitly free models; local fallback if free access is unavailable" : "Used only for naming, never the chat model",
-          currentValue: selectedValue, options: choices });
-      }
-    }
     return configOptions;
+  }
+
+  private async namingModels(state: AcpSessionState, signal?: AbortSignal): Promise<Array<{ model: string; ids: string[] }>> {
+    const config = state.namer!.config;
+    if (config.mode === "local") {
+      return (await localNamingModels(config.endpoint, signal)).map((model) => ({ model, ids: [model] }));
+    }
+    if (config.mode !== "subscription") throw new Error("Choose Cloud or Local before selecting a title model.");
+    // Auxiliary hosted models have their own catalog. The chat picker's
+    // connected-provider filter must not hide a free hosted title route.
+    const entries = (await state.session.listModels()).entries;
+    signal?.throwIfAborted();
+    const choices = new Map<string, { model: string; ids: string[] }>();
+    for (const entry of entries) {
+      if (config.requireFree && entry.free !== true) continue;
+      const choice = choices.get(entry.handle) ?? { model: entry.handle, ids: [] };
+      choice.ids.push(entry.id);
+      choices.set(entry.handle, choice);
+    }
+    return [...choices.values()];
+  }
+
+  private async selectNamingModel(state: AcpSessionState, requested: string, signal?: AbortSignal): Promise<void> {
+    const choices = await this.namingModels(state, signal);
+    signal?.throwIfAborted();
+    const choice = choices.find((entry) => entry.model === requested || entry.ids.includes(requested));
+    if (!choice) throw new Error("That title model is unavailable for this method or naming policy. Use /naming models to list choices.");
+    state.namer!.setModel(choice.model);
+  }
+
+  private async namingCommand(state: AcpSessionState, argument?: string, signal?: AbortSignal): Promise<string> {
+    if (!state.namer) throw new Error("Conversation naming is unavailable.");
+    const usage = "/naming method off|auto|cloud|local\n/naming models\n/naming model <name>";
+    if (!argument) {
+      const config = state.namer.config;
+      const method = namingMethod(config.mode);
+      const label = method[0]!.toUpperCase() + method.slice(1);
+      const model = config.mode === "local" || config.mode === "subscription" ? `\nModel: ${config.model ?? "Not selected"}` : "";
+      return `Conversation titles\nMethod: ${label}${model}${config.mode === "message" ? "\nAuto derives a title from the messages without inference." : ""}\n\n${usage}\n\nSelections apply to this ACP session.`;
+    }
+    const match = argument.match(/^(method|models|model)(?:\s+([\s\S]+))?$/i);
+    if (!match) throw new Error(usage);
+    const action = match[1]!.toLowerCase();
+    const value = match[2]?.trim();
+    if (action === "method") {
+      const method = value?.toLowerCase();
+      if (!method || !Object.hasOwn(NAMING_METHODS, method)) throw new Error(usage);
+      state.namer.setMode(NAMING_METHODS[method as keyof typeof NAMING_METHODS]);
+      return this.namingCommand(state);
+    }
+    if (action === "models" && value) throw new Error(usage);
+    if (action === "model" && value) {
+      await this.selectNamingModel(state, value, signal);
+      return this.namingCommand(state);
+    }
+    const choices = await this.namingModels(state, signal);
+    const current = state.namer.config.model;
+    const lines = choices.map((entry) => `- ${entry.model}${entry.model === current ? " (selected)" : ""}`);
+    if (current && !choices.some((entry) => entry.model === current)) lines.unshift(`Selected: ${current} (currently unavailable)`);
+    return `${lines.length ? lines.join("\n") : "No models available for this method and naming policy."}\n\n/naming model <name>`;
   }
 
   private async hydrateModelSettings(state: AcpSessionState): Promise<boolean> {
@@ -746,12 +782,10 @@ export class LettaAcpAgent {
       return { configOptions: await this.sessionConfigOptions(state) };
     }
     if (params.configId === "naming-model") {
-      if (!state.namer || state.namer.config.mode !== "subscription" || typeof params.value !== "string") {
-        throw new Error("Choose subscription naming before selecting a naming model");
+      if (!state.namer || typeof params.value !== "string") {
+        throw new Error("Choose Cloud or Local before selecting a title model");
       }
-      const entry = (await this.sessionModels(state)).find((model) => model.id === params.value || model.handle === params.value);
-      if (!entry || (state.namer.config.requireFree && entry.free !== true)) throw new Error("That model is unavailable for the configured naming policy");
-      state.namer.setModel(entry.handle);
+      await this.selectNamingModel(state, params.value);
       return { configOptions: await this.sessionConfigOptions(state) };
     }
     if (params.configId === PERMISSION_MODE_CONFIG_ID) {
@@ -1359,6 +1393,23 @@ export class LettaAcpAgent {
     const command = (match[1] ?? "").toLowerCase();
     const argument = match[2]?.trim();
 
+    if (command === "naming") {
+      const abort = new AbortController();
+      state.namingCommandAbort = abort;
+      state.adapterCommandActive = true;
+      let text: string;
+      try { text = await withNamingCancellation(this.namingCommand(state, argument, abort.signal), abort.signal); }
+      catch (error) {
+        if (state.cancelled) return { stopReason: "cancelled" };
+        text = `/naming failed: ${error instanceof Error ? error.message : String(error)}`;
+      } finally {
+        state.namingCommandAbort = undefined;
+        state.adapterCommandActive = false;
+      }
+      await cx.notify(methods.client.session.update, { sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } });
+      return { stopReason: "end_turn" };
+    }
     if (command === "retitle" || command === "rename") {
       let text: string;
       state.adapterCommandActive = true;
@@ -1640,6 +1691,7 @@ export class LettaAcpAgent {
     const state = this.sessions.get(params.sessionId);
     if (!state) return;
     state.cancelled = true;
+    state.namingCommandAbort?.abort();
     state.namer?.cancel();
     // No turn was sent yet; aborting here would create an orphaned SDK result.
     if (state.waitingForConfiguration) {
@@ -1664,6 +1716,7 @@ export class LettaAcpAgent {
       try {
         state.reader?.stop();
         state.namer?.close();
+        state.namingCommandAbort?.abort();
         state.stopCommandUpdates?.();
         state.session.close();
       } catch {

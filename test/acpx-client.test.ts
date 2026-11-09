@@ -483,13 +483,14 @@ async function verifyMcpShutdownOnClientDisconnect(): Promise<void> {
 async function driveConfigurationScenario(
   url: string,
   handle: (message: any, send: (id: number, method: string, params: unknown) => void) => boolean | void,
+  env: Record<string, string> = {},
 ): Promise<void> {
   const home = mkdtempSync(join(tmpdir(), "letta-acp-config-"));
   tempDirs.push(home);
   const child = Bun.spawn([process.execPath, join(import.meta.dir, "..", "src", "index.ts")], {
     env: { ...process.env, HOME: home, USERPROFILE: home, LETTA_ACP_BACKEND: "remote",
       LETTA_ACP_MODEL: undefined, LETTA_ACP_NAMING_MODE: "off", LETTA_APP_SERVER_URL: url,
-      LETTA_AGENT_ID: TEST_RUNTIME.agent_id },
+      LETTA_AGENT_ID: TEST_RUNTIME.agent_id, ...env },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   });
   const stderr = new Response(child.stderr).text();
@@ -530,6 +531,52 @@ async function driveConfigurationScenario(
 }
 
 describe("acpx client compatibility", () => {
+  test("stdio keeps title controls out of the composer while selecting and remembering a local model", async () => {
+    const requests: string[] = [];
+    const ollama = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+      requests.push(`${request.method} ${new URL(request.url).pathname}`);
+      return Response.json({ models: [{ name: "qwen:first" }, { name: "qwen:second" }] });
+    } });
+    const url = startFakeAppServer();
+    let sessionId = "";
+    let latest = "";
+    try {
+      await driveConfigurationScenario(url, (message, send) => {
+        if (message.error) throw new Error(JSON.stringify(message.error));
+        if (message.params?.update?.sessionUpdate === "config_option_update") {
+          expect(message.params.update.configOptions.some((option: any) => option.id.startsWith("naming"))).toBe(false);
+        }
+        if (message.params?.update?.sessionUpdate === "agent_message_chunk") latest = message.params.update.content.text;
+        if (message.id === 2) {
+          sessionId = message.result.sessionId;
+          expect(message.result.configOptions.map((option: any) => option.id)).toEqual(["permissions", "model"]);
+          send(3, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/naming method local" }] });
+        }
+        if (message.id === 3) {
+          expect(latest).toContain("Method: Local");
+          send(4, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/naming models" }] });
+        }
+        if (message.id === 4) {
+          expect(latest).toContain("qwen:second");
+          send(5, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/naming model qwen:second" }] });
+        }
+        if (message.id === 5) {
+          expect(latest).toContain("Model: qwen:second");
+          send(6, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/naming method cloud" }] });
+        }
+        if (message.id === 6) {
+          expect(latest).toContain("Method: Cloud");
+          send(7, "session/prompt", { sessionId, prompt: [{ type: "text", text: "/naming method local" }] });
+        }
+        if (message.id === 7) {
+          expect(latest).toContain("Model: qwen:second");
+          expect(requests).toEqual(["GET /api/tags", "GET /api/tags"]);
+          return true;
+        }
+      }, { LETTA_ACP_NAMING_ENDPOINT: `http://127.0.0.1:${ollama.port}` });
+    } finally { ollama.stop(true); }
+  }, acpxTestTimeoutMs);
+
   test("stdio restores persisted variants, refreshes slash-model selection, and orders changes before prompts", async () => {
     const updates: WireMessage[] = [];
     const inputs: WireMessage[] = [];
@@ -724,6 +771,13 @@ describe("acpx client compatibility", () => {
   test("completes a prompt through a real ACP client", async () => {
     const { stdout } = await runAcpx("quiet");
     expect(stdout.trim()).toBe("ACPX_OK");
+  }, acpxTestTimeoutMs);
+
+  test("configures title naming through a real ACP client without a model turn", async () => {
+    const { stdout } = await runAcpx("quiet", ["exec", "/naming method auto"]);
+    expect(stdout).toContain("Method: Auto");
+    expect(stdout).toContain("without inference");
+    expect(stdout).not.toContain("ACPX_OK");
   }, acpxTestTimeoutMs);
 
   test("dispatches manual reflection through a real ACP client", async () => {
