@@ -48,7 +48,7 @@ export class ConversationNamer {
   setModel(model: string): void {
     this.cancel();
     this.models.set(this.config.mode, model);
-    this.config = { ...this.config, model };
+    this.config = { ...this.config, model, ...(this.config.mode === "local" ? { localModel: model } : {}) };
   }
 
   /** Called once after each successful, substantive foreground user turn. */

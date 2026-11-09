@@ -151,6 +151,13 @@ describe("conversation naming lifecycle", () => {
     expect(f.namer.config.model).toBe("my-qwen");
     f.namer.setMode("subscription");
     expect(f.namer.config.model).toBe("my-subscription");
+    f.namer.setMode("local");
+    f.namer.setModel("another-local-model");
+    f.namer.setMode("subscription");
+    expect(f.namer.config.model).toBe("my-subscription");
+    f.namer.setMode("local");
+    expect(f.namer.config.model).toBe("another-local-model");
+    expect(f.namer.config.localModel).toBe("another-local-model");
   });
 
   test("a backend write already in flight completes before a newer exact rename", async () => {
